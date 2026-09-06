@@ -29,7 +29,7 @@ from telethon.errors import SessionPasswordNeededError
 
 # ===================== DATABASE CONFIGURATION ======================
 # MongoDB bağlantı URL'si
-os.environ["MONGODB_URL"] = "mongodb://mongo:CqAwdCHJBpQKaSvhkUNkJPsAsvYYULuu@nozomi.proxy.rlwy.net:38915"
+os.environ["MONGODB_URL"] = "mongodb://mongo:IvzLvbUGBxZrNVUYiJKbObQYBTXlriTK@zephyr.proxy.rlwy.net:31725"
 
 MONGODB_URL = os.environ["MONGODB_URL"]
 
@@ -53,7 +53,7 @@ class TelegramBot:
     # ===================== BOT INITIALIZATION =======================
     def __init__(self):
         # BotFather token
-        self.BOT_TOKEN = "8188644646:AAFcaiJKZKtnXJo5DZSWLUORq4f_Dj_W-Nc"
+        self.BOT_TOKEN = "7436117955:AAFDbqeaaK-5iufvKdiKCgQnQUXboQuZIg8"
         
         # YÖNETİCİ ID'Sİ
         self.ADMIN_ID = 6615127610
