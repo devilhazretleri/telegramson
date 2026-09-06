@@ -1,0 +1,3033 @@
+import asyncio
+import gc
+import glob
+import json
+import os
+import stat
+import threading
+import time
+from datetime import datetime
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+from telethon import TelegramClient
+from telethon.errors import SessionPasswordNeededError
+
+class TelegramBot:
+    def __init__(self):
+        # BotFather token - Environment variable'dan oku, yoksa default kullan
+        self.BOT_TOKEN = os.getenv('BOT_TOKEN', "8023451077:AAGlCOPYNIg0Iuy2Vz7ZqA5zm_Jqv2vfnnc")
+        
+        # YÖNETİCİ ID'Sİ - Environment variable'dan oku, yoksa default kullan
+        self.ADMIN_ID = int(os.getenv('ADMIN_ID', '6615127610'))
+        
+        # Klasörler
+        self.users_dir = 'bot_users'
+        self.ensure_users_directory()
+        
+        # Bot durumları
+        self.user_states = {}
+        self.telethon_clients = {}
+        self.active_tasks = {}
+        self.app = None
+        
+        # Cloud platform detection
+        self.is_cloud_platform = self.detect_cloud_platform()
+        self.heartbeat_task = None
+        
+        # Onaylı kullanıcılar listesi
+        self.approved_users = set()
+        self.load_approved_users()
+        
+        # Thread lock dosya işlemleri için
+        self.file_lock = threading.Lock()
+        self.session_locks = {}  # Her kullanıcı için ayrı lock
+    
+    def detect_cloud_platform(self):
+        """Cloud platform (Railway, Heroku, Render) detection"""
+        cloud_indicators = [
+            'RAILWAY_ENVIRONMENT',
+            'DYNO',  # Heroku
+            'RENDER',
+            'RAILWAY_PROJECT_ID',
+            'HEROKU_APP_NAME',
+            'RENDER_SERVICE_ID'
+        ]
+        
+        is_cloud = any(os.getenv(indicator) for indicator in cloud_indicators)
+        if is_cloud:
+            print("☁️ Cloud platform algılandı - 7/24 aktif mod")
+        else:
+            print("💻 Local platform - Normal mod")
+        return is_cloud
+    
+    async def start_heartbeat(self):
+        """Railway/Cloud platform için heartbeat sistemi"""
+        if not self.is_cloud_platform:
+            return
+            
+        print("💓 Heartbeat sistemi başlatılıyor...")
+        
+        async def heartbeat_loop():
+            heartbeat_count = 0
+            while True:
+                try:
+                    # Her 5 dakikada bir heartbeat
+                    await asyncio.sleep(300)  # 5 dakika
+                    heartbeat_count += 1
+                    
+                    # Log heartbeat
+                    print(f"💓 Heartbeat #{heartbeat_count} - {datetime.now().strftime('%H:%M:%S')}")
+                    
+                    # Aktif task'ları kontrol et
+                    active_count = len(self.active_tasks)
+                    if active_count > 0:
+                        print(f"🔄 Aktif otomatik gönderim: {active_count}")
+                    
+                    # Memory temizliği (her 1 saatte bir)
+                    if heartbeat_count % 12 == 0:
+                        print("🧹 Memory temizliği...")
+                        import gc
+                        gc.collect()
+                        
+                except Exception as e:
+                    print(f"❌ Heartbeat hatası: {str(e)}")
+                    await asyncio.sleep(60)  # Hata durumunda 1 dakika bekle
+        
+        self.heartbeat_task = asyncio.create_task(heartbeat_loop())
+    
+    def get_user_session_lock(self, user_id):
+        """Kullanıcı için session lock al"""
+        if user_id not in self.session_locks:
+            self.session_locks[user_id] = threading.Lock()
+        return self.session_locks[user_id]
+    
+    def get_safe_session_file(self, user_id):
+        """Güvenli session dosya yolu"""
+        return os.path.join(self.users_dir, f'user_{user_id}_session.session')
+        
+    def ensure_users_directory(self):
+        """Kullanıcı klasörünü oluştur"""
+        if not os.path.exists(self.users_dir):
+            os.makedirs(self.users_dir)
+    
+    def get_approved_users_file(self):
+        """Onaylı kullanıcılar dosya yolu"""
+        return os.path.join(self.users_dir, 'approved_users.json')
+    
+    def load_approved_users(self):
+        """Onaylı kullanıcıları yükle"""
+        approved_file = self.get_approved_users_file()
+        if os.path.exists(approved_file):
+            try:
+                with open(approved_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    self.approved_users = set(data.get('approved_users', []))
+            except:
+                self.approved_users = set()
+        else:
+            self.approved_users = set()
+        
+        # Yöneticiyi otomatik onaylı listesine ekle
+        self.approved_users.add(self.ADMIN_ID)
+    
+    def save_approved_users(self):
+        """Onaylı kullanıcıları kaydet"""
+        approved_file = self.get_approved_users_file()
+        data = {
+            'approved_users': list(self.approved_users),
+            'last_updated': datetime.now().isoformat()
+        }
+        with open(approved_file, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    
+    def save_bot_state(self):
+        """Bot durumunu kaydet (Cloud platform için)"""
+        if not self.is_cloud_platform:
+            return
+            
+        try:
+            state_file = os.path.join(self.users_dir, 'bot_state.json')
+            state_data = {
+                'active_auto_sends': list(self.active_tasks.keys()),
+                'last_save': datetime.now().isoformat(),
+                'heartbeat_active': self.heartbeat_task is not None and not self.heartbeat_task.done()
+            }
+            
+            with open(state_file, 'w', encoding='utf-8') as f:
+                json.dump(state_data, f, ensure_ascii=False, indent=2)
+                
+        except Exception as e:
+            print(f"⚠️ Bot durumu kaydetme hatası: {str(e)}")
+    
+    def load_bot_state(self):
+        """Bot durumunu yükle (Cloud platform için)"""
+        if not self.is_cloud_platform:
+            return []
+            
+        try:
+            state_file = os.path.join(self.users_dir, 'bot_state.json')
+            if os.path.exists(state_file):
+                with open(state_file, 'r', encoding='utf-8') as f:
+                    state_data = json.load(f)
+                    return state_data.get('active_auto_sends', [])
+        except Exception as e:
+            print(f"⚠️ Bot durumu yükleme hatası: {str(e)}")
+        
+        return []
+    
+    def is_user_approved(self, user_id):
+        """Kullanıcının onaylı olup olmadığını kontrol et"""
+        # Önce banned kontrolü yap
+        user_data = self.load_user_data(user_id)
+        if user_data.get('approval_status') == 'banned':
+            return False
+        
+        return user_id in self.approved_users
+
+    def is_user_banned(self, user_id):
+        """Kullanıcının yasaklı olup olmadığını kontrol et"""
+        user_data = self.load_user_data(user_id)
+        return user_data.get('approval_status') == 'banned'
+    
+    def approve_user(self, user_id):
+        """Kullanıcıyı onayla"""
+        self.approved_users.add(user_id)
+        self.save_approved_users()
+        
+        # Onay tarihini kullanıcı verilerine kaydet
+        user_data = self.load_user_data(user_id)
+        user_data['approved_date'] = datetime.now().isoformat()
+        user_data['approval_status'] = 'approved'
+        self.save_user_data(user_id, user_data)
+    
+    def reject_user(self, user_id):
+        """Kullanıcı onayını reddet"""
+        if user_id in self.approved_users:
+            self.approved_users.remove(user_id)
+            self.save_approved_users()
+        
+        # Red tarihini kaydet
+        user_data = self.load_user_data(user_id)
+        user_data['rejected_date'] = datetime.now().isoformat()
+        user_data['approval_status'] = 'rejected'
+        self.save_user_data(user_id, user_data)
+
+    def ban_user(self, user_id):
+        """Kullanıcıyı banla"""
+        if user_id in self.approved_users:
+            self.approved_users.remove(user_id)
+            self.save_approved_users()
+        
+        # Ban tarihini kaydet
+        user_data = self.load_user_data(user_id)
+        user_data['banned_date'] = datetime.now().isoformat()
+        user_data['approval_status'] = 'banned'
+        self.save_user_data(user_id, user_data)
+
+    def unban_user(self, user_id):
+        """Kullanıcının banını kaldır"""
+        self.approved_users.add(user_id)
+        self.save_approved_users()
+        
+        # Unban tarihini kaydet
+        user_data = self.load_user_data(user_id)
+        user_data['unbanned_date'] = datetime.now().isoformat()
+        user_data['approval_status'] = 'approved'
+        self.save_user_data(user_id, user_data)
+    
+    def get_user_file(self, user_id):
+        """Kullanıcı dosya yolu"""
+        return os.path.join(self.users_dir, f'user_{user_id}.json')
+    
+    def save_user_data(self, user_id, data):
+        """Kullanıcı verilerini güvenli olarak kaydet"""
+        user_file = self.get_user_file(user_id)
+        data['last_updated'] = datetime.now().isoformat()
+        data['user_id'] = user_id
+        
+        with self.file_lock:
+            try:
+                # Geçici dosyaya yaz, sonra taşı (atomic operation)
+                temp_file = user_file + '.tmp'
+                with open(temp_file, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                
+                # Windows'ta rename işlemi
+                if os.path.exists(user_file):
+                    os.remove(user_file)
+                os.rename(temp_file, user_file)
+                
+            except Exception as e:
+                print(f"❌ Kullanıcı verisi kaydetme hatası - {user_id}: {str(e)}")
+                # Geçici dosyayı temizle
+                if os.path.exists(temp_file):
+                    try:
+                        os.remove(temp_file)
+                    except:
+                        pass
+    
+    def load_user_data(self, user_id):
+        """Kullanıcı verilerini güvenli olarak yükle"""
+        user_file = self.get_user_file(user_id)
+        
+        with self.file_lock:
+            if os.path.exists(user_file):
+                try:
+                    with open(user_file, 'r', encoding='utf-8') as f:
+                        return json.load(f)
+                except Exception as e:
+                    print(f"❌ Kullanıcı verisi yükleme hatası - {user_id}: {str(e)}")
+                    return {}
+            return {}
+    
+    async def create_safe_telethon_client(self, user_id, user_data):
+        """Güvenli Telethon client oluştur"""
+        session_lock = self.get_user_session_lock(user_id)
+        
+        with session_lock:
+            try:
+                # Eğer zaten bir client varsa, onu güvenli şekilde kapat
+                if user_id in self.telethon_clients:
+                    print(f"🔄 Mevcut client kapatılıyor - {user_id}")
+                    await self.safe_disconnect_client(user_id)
+                    await asyncio.sleep(2)  # Daha uzun bekleme
+                
+                session_file = self.get_safe_session_file(user_id)
+                
+                # Session dosyasının bulunduğu klasöre tam erişim ver
+                try:
+                    if not os.path.exists(self.users_dir):
+                        os.makedirs(self.users_dir, mode=0o755)
+                    
+                    # Eğer session dosyası varsa, yazılabilir yap
+                    if os.path.exists(session_file):
+                        os.chmod(session_file, stat.S_IWRITE | stat.S_IREAD)
+                    
+                    # Aynı şekilde .session-journal dosyası için de
+                    journal_file = session_file + '-journal'
+                    if os.path.exists(journal_file):
+                        os.chmod(journal_file, stat.S_IWRITE | stat.S_IREAD)
+                        
+                except Exception as chmod_error:
+                    print(f"⚠️ Dosya izinleri ayarlanamadı - {user_id}: {str(chmod_error)}")
+                
+                # Sadece 1 deneme yap, başarısız olursa session'ı sil
+                try:
+                    client = TelegramClient(
+                        session_file, 
+                        user_data['api_id'], 
+                        user_data['api_hash']
+                    )
+                    await client.connect()
+                    return client
+                except Exception as e:
+                    # Herhangi bir hata varsa session dosyasını sil ve yeniden dene
+                    print(f"⚠️ Session hatası - {user_id}: {str(e)[:100]}")
+                    
+                    try:
+                        if os.path.exists(session_file):
+                            os.chmod(session_file, stat.S_IWRITE)
+                            os.remove(session_file)
+                        journal_file = session_file + '-journal'
+                        if os.path.exists(journal_file):
+                            os.chmod(journal_file, stat.S_IWRITE)
+                            os.remove(journal_file)
+                        print(f"🔄 Session dosyası silindi - {user_id}")
+                    except Exception as del_error:
+                        print(f"⚠️ Session dosyası silinemedi - {user_id}: {str(del_error)}")
+                    
+                    # Temiz session ile yeniden dene
+                    await asyncio.sleep(1)
+                    client = TelegramClient(
+                        session_file, 
+                        user_data['api_id'], 
+                        user_data['api_hash']
+                    )
+                    await client.connect()
+                    return client
+                
+            except Exception as e:
+                print(f"❌ Telethon client oluşturma hatası - {user_id}: {str(e)}")
+                raise e
+    
+    async def try_auto_login(self, user_id, user_data):
+        """Bot restart sonrası otomatik giriş dene"""
+        try:
+            # Session dosyası var mı kontrol et
+            session_file = self.get_safe_session_file(user_id)
+            if not os.path.exists(session_file):
+                print(f"⚠️ Session dosyası bulunamadı - {user_id}")
+                return False
+            
+            # API bilgileri var mı kontrol et
+            if not all([user_data.get('api_id'), user_data.get('api_hash'), user_data.get('phone_number')]):
+                print(f"⚠️ API bilgileri eksik - {user_id}")
+                return False
+            
+            print(f"🔄 Otomatik giriş deneniyor - {user_id}")
+            
+            # Client oluştur
+            client = await self.create_safe_telethon_client(user_id, user_data)
+            
+            # Authorization kontrolü
+            if await client.is_user_authorized():
+                print(f"✅ Otomatik giriş başarılı - {user_id}")
+                user_data['phone_verified'] = True
+                user_data['session_verified'] = True
+                user_data['auto_login_success'] = datetime.now().isoformat()
+                self.save_user_data(user_id, user_data)
+                
+                # Client'ı güvenli şekilde kapat (sadece test amaçlı açtık)
+                await self.safe_disconnect_client(user_id)
+                return True
+            else:
+                print(f"⚠️ Session süresi dolmuş - {user_id}")
+                
+                # Session'ı yenilemeyi dene
+                try:
+                    await client.start(phone=user_data['phone_number'])
+                    print(f"✅ Session yenilendi - {user_id}")
+                    user_data['phone_verified'] = True
+                    user_data['session_verified'] = True
+                    user_data['session_renewed'] = datetime.now().isoformat()
+                    self.save_user_data(user_id, user_data)
+                    
+                    await self.safe_disconnect_client(user_id)
+                    return True
+                except Exception as e:
+                    print(f"❌ Session yenilenemedi - {user_id}: {str(e)}")
+                    await self.safe_disconnect_client(user_id)
+                    return False
+                    
+        except Exception as e:
+            print(f"❌ Otomatik giriş hatası - {user_id}: {str(e)}")
+            return False
+    
+    async def initialize_all_sessions(self):
+        """Bot başlangıcında tüm kullanıcıların session'larını kontrol et"""
+        print("🔄 Session'lar kontrol ediliyor...")
+        
+        if not os.path.exists(self.users_dir):
+            print("📁 Kullanıcı verileri klasörü bulunamadı")
+            return
+        
+        successful_logins = 0
+        failed_logins = 0
+        
+        # Tüm kullanıcı dosyalarını tara
+        for filename in os.listdir(self.users_dir):
+            if filename.endswith('.json') and filename.startswith('user_'):
+                try:
+                    user_id = int(filename.replace('user_', '').replace('.json', ''))
+                    user_data = self.load_user_data(user_id)
+                    
+                    if user_data and user_data.get('phone_verified'):
+                        print(f"🔍 Session kontrol ediliyor - {user_id}")
+                        
+                        if await self.try_auto_login(user_id, user_data):
+                            successful_logins += 1
+                            print(f"✅ Session hazır - {user_id}")
+                            
+                            # Otomatik gönderim recovery (Cloud platform için)
+                            if self.is_cloud_platform and user_data.get('auto_send_active'):
+                                print(f"🔄 Otomatik gönderim recovery - {user_id}")
+                                await self.restore_auto_send(user_id, user_data)
+                        else:
+                            failed_logins += 1
+                            print(f"❌ Session geçersiz - {user_id}")
+                            
+                except Exception as e:
+                    print(f"⚠️ Kullanıcı session kontrol hatası - {filename}: {str(e)}")
+                    failed_logins += 1
+        
+        print(f"📊 Session kontrol sonucu: ✅ {successful_logins} başarılı, ❌ {failed_logins} başarısız")
+    
+    async def restore_auto_send(self, user_id, user_data):
+        """Container restart sonrası otomatik gönderimi restore et"""
+        try:
+            # Gerekli alanları kontrol et
+            required = ['api_id', 'api_hash', 'phone_number', 'groups', 'message']
+            if not all(user_data.get(field) for field in required):
+                print(f"❌ Auto-send restore - eksik veriler - {user_id}")
+                return
+            
+            # Zaten aktif task var mı kontrol et
+            if user_id in self.active_tasks and not self.active_tasks[user_id].done():
+                print(f"⚠️ Auto-send zaten aktif - {user_id}")
+                return
+            
+            print(f"🔄 Auto-send restore başlıyor - {user_id}")
+            
+            # Auto-send task'ını başlat
+            task = asyncio.create_task(self.auto_send_loop(user_id))
+            self.active_tasks[user_id] = task
+            
+            # Restore bilgilerini kaydet
+            user_data['auto_send_restored'] = datetime.now().isoformat()
+            user_data['restore_count'] = user_data.get('restore_count', 0) + 1
+            self.save_user_data(user_id, user_data)
+            
+            print(f"✅ Auto-send restore başarılı - {user_id}")
+            
+            # Kullanıcıya bildirim gönder
+            try:
+                interval_minutes = user_data.get('send_interval_minutes', 60)
+                hours = interval_minutes // 60
+                minutes = interval_minutes % 60
+                interval_display = f"{hours} saat {minutes} dakika" if hours > 0 else f"{minutes} dakika"
+                
+                await self.app.bot.send_message(
+                    chat_id=user_id,
+                    text=f"🔄 Otomatik gönderim restore edildi!\n\n"
+                         f"✅ Bot yeniden başladı\n"
+                         f"⏰ Gönderim aralığı: {interval_display}\n"
+                         f"🎯 Container restart sonrası otomatik devam\n\n"
+                         f"💡 Sistem 7/24 aktif kalacak şekilde optimize edildi!"
+                )
+            except Exception as notify_error:
+                print(f"⚠️ Restore bildirim hatası - {user_id}: {str(notify_error)}")
+                
+        except Exception as e:
+            print(f"❌ Auto-send restore hatası - {user_id}: {str(e)}")
+            
+            # Restore başarısız durumunda flag'i temizle
+            user_data['auto_send_active'] = False
+            user_data['restore_error'] = str(e)
+            user_data['restore_error_time'] = datetime.now().isoformat()
+            self.save_user_data(user_id, user_data)
+    
+    async def safe_disconnect_client(self, user_id):
+        """Güvenli client bağlantısını kes"""
+        if user_id in self.telethon_clients:
+            session_lock = self.get_user_session_lock(user_id)
+            with session_lock:
+                try:
+                    client = self.telethon_clients[user_id]
+                    if client and client.is_connected():
+                        # Telethon client'ı güvenli şekilde kapat
+                        try:
+                            # Önce pending update'leri iptal et
+                            if hasattr(client, '_sender') and client._sender:
+                                try:
+                                    await asyncio.wait_for(client._sender.disconnect(), timeout=3.0)
+                                except asyncio.TimeoutError:
+                                    print(f"⚠️ Sender disconnect timeout - {user_id}")
+                                except Exception as e:
+                                    print(f"⚠️ Sender disconnect hatası - {user_id}: {str(e)}")
+                            
+                            # Ana client'ı kapat
+                            await asyncio.wait_for(client.disconnect(), timeout=5.0)
+                            
+                        except asyncio.TimeoutError:
+                            print(f"⚠️ Client disconnect timeout - {user_id}")
+                            # Zorla kapatmaya çalış
+                            try:
+                                if hasattr(client, '_connection') and client._connection:
+                                    await client._connection.disconnect()
+                            except:
+                                pass
+                        except Exception as disconnect_error:
+                            print(f"⚠️ Client disconnect hatası - {user_id}: {str(disconnect_error)}")
+                    
+                    del self.telethon_clients[user_id]
+                    print(f"✅ Client güvenli şekilde kapatıldı - {user_id}")
+                    
+                    # Kısa bekleme - sistem kaynaklarının temizlenmesi için
+                    await asyncio.sleep(0.5)
+                    
+                except Exception as e:
+                    print(f"⚠️ Client kapatma hatası - {user_id}: {str(e)}")
+                    # Zorla temizle
+                    try:
+                        del self.telethon_clients[user_id]
+                    except:
+                        pass
+    
+    async def cleanup_user_sessions(self, user_id):
+        """Belirli bir kullanıcının tüm session'larını temizle"""
+        try:
+            print(f"🧹 Session temizliği başlıyor - {user_id}")
+            
+            # Aktif task'ı iptal et
+            if user_id in self.active_tasks:
+                try:
+                    task = self.active_tasks[user_id]
+                    if not task.done():
+                        task.cancel()
+                        try:
+                            await asyncio.wait_for(task, timeout=2.0)
+                        except (asyncio.CancelledError, asyncio.TimeoutError):
+                            pass
+                    del self.active_tasks[user_id]
+                    print(f"✅ Aktif task iptal edildi - {user_id}")
+                except Exception as e:
+                    print(f"⚠️ Task iptal hatası - {user_id}: {str(e)}")
+            
+            # Aktif client'ı kapat
+            if user_id in self.telethon_clients:
+                try:
+                    client = self.telethon_clients[user_id]
+                    if client and client.is_connected():
+                        # Aggressive disconnect
+                        try:
+                            await asyncio.wait_for(client.disconnect(), timeout=3.0)
+                        except asyncio.TimeoutError:
+                            print(f"⚠️ Client disconnect timeout - {user_id}")
+                            # Zorla kapat
+                            try:
+                                if hasattr(client, '_connection') and client._connection:
+                                    await client._connection.disconnect()
+                            except:
+                                pass
+                    del self.telethon_clients[user_id]
+                    print(f"✅ Client kapatıldı - {user_id}")
+                except Exception as e:
+                    print(f"⚠️ Client kapatma hatası - {user_id}: {str(e)}")
+                    try:
+                        del self.telethon_clients[user_id]
+                    except:
+                        pass
+            
+            # User states'i temizle
+            if user_id in self.user_states:
+                try:
+                    del self.user_states[user_id]
+                    print(f"✅ User state temizlendi - {user_id}")
+                except Exception as e:
+                    print(f"⚠️ User state temizleme hatası - {user_id}: {str(e)}")
+            
+            # Session lock'u temizle
+            if user_id in self.session_locks:
+                try:
+                    del self.session_locks[user_id]
+                    print(f"✅ Session lock temizlendi - {user_id}")
+                except Exception as e:
+                    print(f"⚠️ Session lock temizleme hatası - {user_id}: {str(e)}")
+            
+            # Kısa bekleme - sistem kaynaklarının temizlenmesi için
+            await asyncio.sleep(1)
+            print(f"✅ Session temizliği tamamlandı - {user_id}")
+            
+        except Exception as e:
+            print(f"⚠️ User session cleanup hatası - {user_id}: {str(e)}")
+
+    async def global_cleanup(self):
+        """Tüm açık session'ları ve task'ları temizle"""
+        try:
+            print("🧹 Global cleanup başlıyor...")
+            
+            # Heartbeat task'ını iptal et
+            if self.heartbeat_task and not self.heartbeat_task.done():
+                try:
+                    self.heartbeat_task.cancel()
+                    await asyncio.wait_for(self.heartbeat_task, timeout=1.0)
+                    print("✅ Heartbeat task iptal edildi")
+                except:
+                    print("⚠️ Heartbeat task zorla iptal edildi")
+            
+            # Tüm aktif task'ları iptal et
+            for user_id, task in list(self.active_tasks.items()):
+                try:
+                    if not task.done():
+                        task.cancel()
+                        try:
+                            await asyncio.wait_for(task, timeout=1.0)
+                        except:
+                            pass
+                    print(f"✅ Task iptal edildi - {user_id}")
+                except Exception as e:
+                    print(f"⚠️ Task iptal hatası - {user_id}: {str(e)}")
+            
+            self.active_tasks.clear()
+            
+            # Tüm client'ları kapat
+            for user_id, client in list(self.telethon_clients.items()):
+                try:
+                    if client and client.is_connected():
+                        await asyncio.wait_for(client.disconnect(), timeout=2.0)
+                    print(f"✅ Client kapatıldı - {user_id}")
+                except Exception as e:
+                    print(f"⚠️ Client kapatma hatası - {user_id}: {str(e)}")
+            
+            self.telethon_clients.clear()
+            self.session_locks.clear()
+            self.user_states.clear()
+            
+            # Pending task'ları bekle
+            pending_tasks = [task for task in asyncio.all_tasks() if not task.done()]
+            if pending_tasks:
+                print(f"⏳ {len(pending_tasks)} pending task bekleniyor...")
+                await asyncio.sleep(2)
+            
+            print("✅ Global cleanup tamamlandı")
+            
+        except Exception as e:
+            print(f"⚠️ Global cleanup hatası: {str(e)}")
+    
+    def cleanup_old_sessions(self):
+        """Eski session dosyalarını temizle"""
+        try:
+            session_pattern = os.path.join(self.users_dir, "user_*_session.session*")
+            session_files = glob.glob(session_pattern)
+            
+            for session_file in session_files:
+                try:
+                    # Dosya izinlerini kontrol et ve değiştir
+                    if os.path.exists(session_file):
+                        # Dosyayı yazılabilir yap
+                        os.chmod(session_file, stat.S_IWRITE | stat.S_IREAD)
+                        
+                        # 7 günden eski session dosyalarını sil
+                        if os.path.getmtime(session_file) < time.time() - (7 * 24 * 3600):
+                            os.remove(session_file)
+                            print(f"🗑️ Eski session dosyası silindi: {os.path.basename(session_file)}")
+                except Exception as e:
+                    print(f"⚠️ Session dosyası silinemedi {session_file}: {str(e)}")
+        except Exception as e:
+            print(f"⚠️ Session temizleme hatası: {str(e)}")
+    
+    async def process_group_list(self, raw_groups, user_id):
+        """Grup listesini işle ve doğrula"""
+        processed_groups = []
+        
+        for group in raw_groups:
+            group = group.strip()
+            if not group:
+                continue
+                
+            # Farklı grup formatlarını işle
+            processed_group = self.parse_group_identifier(group)
+            if processed_group:
+                processed_groups.append(processed_group)
+                print(f"✅ Grup eklendi - {user_id}: {processed_group['display']}")
+            else:
+                print(f"⚠️ Geçersiz grup formatı - {user_id}: {group}")
+        
+        return processed_groups
+    
+    def parse_group_identifier(self, group_input):
+        """Grup tanımlayıcısını parse et"""
+        group_input = group_input.strip()
+        
+        # Telegram link formatı: https://t.me/grupadi
+        if group_input.startswith('https://t.me/'):
+            username = group_input.replace('https://t.me/', '').strip()
+            if username:
+                return {
+                    'type': 'username',
+                    'value': username,
+                    'display': f"@{username}",
+                    'original': group_input
+                }
+        
+        # Grup ID formatı: -1001234567890
+        elif group_input.startswith('-100') and group_input[1:].isdigit():
+            return {
+                'type': 'id',
+                'value': int(group_input),
+                'display': f"ID: {group_input}",
+                'original': group_input
+            }
+        
+        # Telefon numarası formatı: +905551234567
+        elif group_input.startswith('+') and len(group_input) > 10:
+            return {
+                'type': 'phone',
+                'value': group_input,
+                'display': f"📱 {group_input}",
+                'original': group_input
+            }
+        
+        # Username formatı: @grupadi veya grupadi
+        elif group_input.startswith('@'):
+            username = group_input[1:].strip()
+            if username and username.replace('_', '').replace('.', '').isalnum():
+                return {
+                    'type': 'username',
+                    'value': username,
+                    'display': f"@{username}",
+                    'original': group_input
+                }
+        
+        # Direkt username (@ olmadan)
+        elif group_input.replace('_', '').replace('.', '').isalnum():
+            return {
+                'type': 'username',
+                'value': group_input,
+                'display': f"@{group_input}",
+                'original': group_input
+            }
+        
+        # Negatif ID (başka format)
+        elif group_input.startswith('-') and group_input[1:].isdigit():
+            return {
+                'type': 'id',
+                'value': int(group_input),
+                'display': f"ID: {group_input}",
+                'original': group_input
+            }
+        
+        return None
+    
+    def format_group_display(self, group_data):
+        """Grup verilerini görüntülenebilir formata çevir"""
+        if isinstance(group_data, dict):
+            return group_data.get('display', str(group_data.get('value', 'Bilinmeyen')))
+        return str(group_data)
+    
+    async def validate_group_access(self, client, group_data):
+        """Gruba erişim olup olmadığını kontrol et"""
+        try:
+            if group_data['type'] == 'id':
+                entity = await client.get_entity(group_data['value'])
+            elif group_data['type'] == 'username':
+                entity = await client.get_entity(group_data['value'])
+            elif group_data['type'] == 'phone':
+                entity = await client.get_entity(group_data['value'])
+            else:
+                return False, "Desteklenmeyen grup türü"
+            
+            # Grup bilgilerini al
+            if hasattr(entity, 'title'):
+                group_title = entity.title
+            else:
+                group_title = "Bilinmeyen Grup"
+            
+            return True, group_title
+            
+        except Exception as e:
+            error_msg = str(e)
+            if "No user has" in error_msg:
+                return False, "Kullanıcı bulunamadı"
+            elif "cannot find any entity" in error_msg:
+                return False, "Grup bulunamadı"
+            elif "CHAT_ADMIN_REQUIRED" in error_msg:
+                return False, "Admin yetkisi gerekli"
+            elif "USER_BANNED_IN_CHANNEL" in error_msg:
+                return False, "Gruptan yasaklandınız"
+            else:
+                return False, f"Erişim hatası: {error_msg[:50]}"
+    
+    def get_phone_code_keyboard(self):
+        """Telefon kodu için sayısal klavye"""
+        keyboard = [
+            [InlineKeyboardButton("1", callback_data="code_1"), 
+             InlineKeyboardButton("2", callback_data="code_2"), 
+             InlineKeyboardButton("3", callback_data="code_3")],
+            [InlineKeyboardButton("4", callback_data="code_4"), 
+             InlineKeyboardButton("5", callback_data="code_5"), 
+             InlineKeyboardButton("6", callback_data="code_6")],
+            [InlineKeyboardButton("7", callback_data="code_7"), 
+             InlineKeyboardButton("8", callback_data="code_8"), 
+             InlineKeyboardButton("9", callback_data="code_9")],
+            [InlineKeyboardButton("⬅️ Sil", callback_data="code_delete"), 
+             InlineKeyboardButton("0", callback_data="code_0"), 
+             InlineKeyboardButton("✅ Onayla", callback_data="code_confirm")],
+            [InlineKeyboardButton("🔄 Yeni Kod", callback_data="code_resend"), 
+             InlineKeyboardButton("❌ İptal", callback_data="code_cancel")]
+        ]
+        return InlineKeyboardMarkup(keyboard)
+
+    async def safe_edit_message(self, query, text, reply_markup=None):
+        """Güvenli mesaj düzenleme - timeout ve eski query hatalarını yakala"""
+        try:
+            await query.edit_message_text(text=text, reply_markup=reply_markup)
+            return True
+        except Exception as e:
+            error_msg = str(e)
+            if any(err in error_msg for err in [
+                "Query is too old", 
+                "response timeout expired", 
+                "query id is invalid",
+                "Message is not modified"
+            ]):
+                print(f"⚠️ Mesaj düzenleme atlandı: {error_msg[:50]}")
+                return False
+            else:
+                print(f"❌ Mesaj düzenleme hatası: {error_msg}")
+                # Kritik olmayan hatalar için yeniden deneme
+                try:
+                    await asyncio.sleep(0.5)
+                    await query.edit_message_text(text=text, reply_markup=reply_markup)
+                    return True
+                except:
+                    print(f"❌ Mesaj düzenleme tekrar denemesi başarısız")
+                    return False
+    
+    # =============================================================================
+    # YÖNETİCİ FONKSİYONLARI
+    # =============================================================================
+    
+    async def notify_admin_new_user(self, user_id, user_name):
+        """Yöneticiye yeni kullanıcı bildirimi gönder"""
+        try:
+            if not self.is_user_approved(user_id):
+                message = f"""🔔 YENİ KULLANICI TALEBİ
+
+👤 Kullanıcı: {user_name}
+🆔 ID: {user_id}
+⏰ Tarih: {datetime.now().strftime('%d.%m.%Y %H:%M')}
+
+Bu kullanıcının bot'u kullanmasını onaylıyor musunuz?"""
+                
+                keyboard = [
+                    [InlineKeyboardButton("✅ Onayla", callback_data=f"approve_{user_id}"),
+                     InlineKeyboardButton("❌ Reddet", callback_data=f"reject_{user_id}")],
+                    [InlineKeyboardButton("👤 Kullanıcı Bilgileri", callback_data=f"user_info_{user_id}")]
+                ]
+                
+                await self.app.bot.send_message(
+                    chat_id=self.ADMIN_ID,
+                    text=message,
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+        except Exception as e:
+            print(f"❌ Yönetici bildirimi hatası: {str(e)}")
+
+    # =============================================================================
+    # BOT KOMUTLARI
+    # =============================================================================
+    
+    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Ana komut"""
+        user_id = update.effective_user.id
+        user_name = update.effective_user.first_name
+        
+        print(f"🚀 /start - Kullanıcı: {user_id} ({user_name})")
+        
+        # Ban kontrolü (yönetici hariç)
+        if user_id != self.ADMIN_ID and self.is_user_banned(user_id):
+            user_data = self.load_user_data(user_id)
+            banned_date = user_data.get('banned_date', 'Bilinmiyor')
+            if banned_date != 'Bilinmiyor':
+                try:
+                    date_obj = datetime.fromisoformat(banned_date.replace('Z', '+00:00'))
+                    formatted_date = date_obj.strftime('%d.%m.%Y %H:%M')
+                except:
+                    formatted_date = banned_date[:16]
+            else:
+                formatted_date = 'Bilinmiyor'
+            
+            message = f"""🚫 HESAP YASAKLANDI
+
+Merhaba {user_name},
+
+❌ Hesabınız yasaklanmıştır.
+📅 Yasaklanma Tarihi: {formatted_date}
+
+📞 İtiraz için yöneticiye başvurun:
+🆔 Yönetici ID: {self.ADMIN_ID}
+
+💡 Bu mesajı yöneticiye göstererek af talebinde bulunabilirsiniz."""
+            
+            await update.message.reply_text(message)
+            return
+        
+        # Yönetici kontrolü
+        if user_id == self.ADMIN_ID:
+            # Yönetici için özel menü
+            message = f"""🔑 YÖNETİCİ PANELİ
+
+Merhaba {user_name}! 👋
+
+✨ Yönetici Özellikleri:
+📱 Telegram hesabınızı bağlayın
+📋 Hedef grupları ekleyin  
+📝 Mesaj içeriği belirleyin
+🚀 Anlık mesaj gönderimi
+⏰ Özelleştirilebilir otomatik gönderim
+👥 Kullanıcı onayları
+
+Başlamak için bir seçenek seçin:"""
+            
+            keyboard = [
+                [InlineKeyboardButton("🔧 Kurulum Başlat", callback_data="setup")],
+                [InlineKeyboardButton("📊 Ayarlarım", callback_data="settings")],
+                [InlineKeyboardButton("👥 Bekleyen Onaylar", callback_data="pending_approvals")],
+                [InlineKeyboardButton("📋 Onaylı Kullanıcılar", callback_data="approved_users")],
+                [InlineKeyboardButton("🚫 Yasaklı Kullanıcılar", callback_data="banned_users")],
+                [InlineKeyboardButton("❓ Yardım", callback_data="help")]
+            ]
+        
+        # Onaylı kullanıcı kontrolü
+        elif self.is_user_approved(user_id):
+            message = f"""🤖 Telegram Mesaj Gönderici Bot
+
+Merhaba {user_name}! 👋
+
+✅ Hesabınız onaylandı!
+
+✨ Özellikler:
+📱 Telegram hesabınızı bağlayın
+📋 Hedef grupları ekleyin  
+📝 Mesaj içeriği belirleyin
+🚀 Anlık mesaj gönderimi
+⏰ Özelleştirilebilir otomatik gönderim
+
+Başlamak için kuruluma tıklayın:"""
+            
+            keyboard = [
+                [InlineKeyboardButton("🔧 Kurulum Başlat", callback_data="setup")],
+                [InlineKeyboardButton("📊 Ayarlarım", callback_data="settings")],
+                [InlineKeyboardButton("❓ Yardım", callback_data="help")]
+            ]
+        
+        # Onaysız kullanıcı
+        else:
+            message = f"""🔒 ERİŞİM BEKLEMEDE
+
+Merhaba {user_name}! 👋
+
+⏳ Hesabınız henüz onaylanmamış.
+
+📝 Kullanıcı ID'niz: {user_id}
+👤 Adınız: {user_name}
+
+🔔 Yöneticiye onay talebi gönderildi.
+⏰ Lütfen onay bekleyin.
+
+💡 Bu ID'yi yöneticiye göstererek onay talep edebilirsiniz."""
+            
+            keyboard = [
+                [InlineKeyboardButton("🔄 Durumu Kontrol Et", callback_data="check_approval")],
+                [InlineKeyboardButton("📞 Yöneticiye Mesaj", callback_data="contact_admin")]
+            ]
+            
+            # Yöneticiye bildirim gönder
+            await self.notify_admin_new_user(user_id, user_name)
+        
+        await update.message.reply_text(
+            message, 
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    # =============================================================================
+    # BUTON İŞLEMLERİ
+    # =============================================================================
+    
+    async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Buton tıklamaları"""
+        query = update.callback_query
+        
+        # Güvenli query.answer() - eski query'leri yakala
+        try:
+            await query.answer()
+        except Exception as e:
+            error_msg = str(e)
+            if "Query is too old" in error_msg or "response timeout expired" in error_msg:
+                print(f"⚠️ Eski callback query atlandı - {query.from_user.id}")
+                return  # Eski query'yi işleme, direkt çık
+            elif "query id is invalid" in error_msg:
+                print(f"⚠️ Geçersiz query ID - {query.from_user.id}")
+                return
+            else:
+                print(f"⚠️ Query answer hatası: {error_msg}")
+                # Diğer hataları yoksay ve devam et
+        
+        user_id = query.from_user.id
+        data = query.data
+        
+        print(f"🔘 Buton: {data} - Kullanıcı: {user_id}")
+        
+        try:
+            # Yönetici işlemleri
+            if data.startswith("approve_"):
+                await self.handle_user_approval(query, data)
+            elif data.startswith("reject_"):
+                await self.handle_user_rejection(query, data)
+            elif data.startswith("ban_"):
+                await self.handle_user_ban(query, data)
+            elif data.startswith("unban_"):
+                await self.handle_user_unban(query, data)
+            elif data.startswith("user_info_"):
+                await self.show_user_info(query, data)
+            elif data == "pending_approvals":
+                await self.show_pending_approvals(query, user_id)
+            elif data == "approved_users":
+                await self.show_approved_users(query, user_id)
+            elif data == "banned_users":
+                await self.show_banned_users(query, user_id)
+            elif data == "check_approval":
+                await self.check_user_approval_status(query, user_id)
+            elif data == "contact_admin":
+                await self.show_admin_contact(query, user_id)
+            
+            # Normal kullanıcı işlemleri - Sadece onaylı kullanıcılar için
+            elif self.is_user_approved(user_id) or user_id == self.ADMIN_ID:
+                if data == "setup":
+                    await self.setup_start(query, user_id)
+                elif data == "settings":
+                    await self.show_settings(query, user_id)
+                elif data == "help":
+                    await self.show_help(query)
+                elif data == "add_api":
+                    await self.request_api(query, user_id)
+                elif data == "add_groups":
+                    await self.request_groups(query, user_id)
+                elif data == "add_message":
+                    await self.request_message(query, user_id)
+                elif data == "add_interval":
+                    await self.request_interval(query, user_id)
+                elif data == "group_details":
+                    await self.show_group_details(query, user_id)
+                elif data == "validate_groups":
+                    await self.validate_groups(query, user_id)
+                elif data == "send_now":
+                    await self.send_messages_now(query, user_id)
+                elif data == "start_auto":
+                    await self.start_auto_send(query, user_id)
+                elif data == "stop_auto":
+                    await self.stop_auto_send(query, user_id)
+                elif data == "back":
+                    await self.start_command_callback(query)
+                elif data == "reset_session":
+                    await self.reset_user_session(query, user_id)
+                elif data.startswith("code_"):
+                    await self.handle_phone_code(query, user_id, data)
+            else:
+                # Onaysız kullanıcı uyarısı
+                try:
+                    await query.edit_message_text(
+                        "🔒 Bu işlemi yapmak için yönetici onayı gerekiyor.\n\n⏳ Lütfen onay bekleyin."
+                    )
+                except Exception as edit_error:
+                    print(f"⚠️ Mesaj düzenleme hatası - {user_id}: {str(edit_error)}")
+        except Exception as e:
+            error_msg = str(e)
+            print(f"❌ Button callback hatası - {user_id}: {error_msg}")
+            
+            # Telegram API hatalarını yakala
+            if "Query is too old" in error_msg or "response timeout expired" in error_msg:
+                print(f"⚠️ Callback query timeout - {user_id}")
+                return  # Timeout hatalarında sessizce çık
+            elif "Message is not modified" in error_msg:
+                print(f"⚠️ Mesaj zaten aynı içerikte - {user_id}")
+                # Kullanıcıya geri bildirim ver
+                try:
+                    await query.answer("✅ İşlem tamamlandı", show_alert=False)
+                except:
+                    pass  # Answer da başarısız olursa sessiz kal
+            elif "Bad Request" in error_msg:
+                try:
+                    await query.answer("❌ İstek hatası, lütfen tekrar deneyin", show_alert=True)
+                except:
+                    pass
+                await query.answer("✅ İşlem tamamlandı", show_alert=False)
+            elif "Bad Request" in error_msg:
+                await query.answer("❌ İstek hatası, lütfen tekrar deneyin", show_alert=True)
+            else:
+                await query.answer("❌ Bir hata oluştu", show_alert=True)
+    
+    # =============================================================================
+    # YÖNETİCİ İŞLEMLERİ
+    # =============================================================================
+    
+    async def handle_user_approval(self, query, data):
+        """Kullanıcı onayını işle"""
+        if query.from_user.id != self.ADMIN_ID:
+            await query.answer("❌ Bu işlemi sadece yönetici yapabilir!", show_alert=True)
+            return
+        
+        user_id = int(data.split("_")[1])
+        self.approve_user(user_id)
+        
+        await self.safe_edit_message(
+            query,
+            f"✅ Kullanıcı onaylandı!\n\n👤 ID: {user_id}\n⏰ Tarih: {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+        )
+        
+        # Kullanıcıya onay mesajı gönder
+        try:
+            await self.app.bot.send_message(
+                chat_id=user_id,
+                text="🎉 Hesabınız onaylandı!\n\n✅ Artık bot'u kullanabilirsiniz.\n📱 /start yazarak başlayabilirsiniz."
+            )
+        except:
+            pass
+    
+    async def handle_user_rejection(self, query, data):
+        """Kullanıcı reddini işle"""
+        if query.from_user.id != self.ADMIN_ID:
+            await query.answer("❌ Bu işlemi sadece yönetici yapabilir!", show_alert=True)
+            return
+        
+        user_id = int(data.split("_")[1])
+        self.reject_user(user_id)
+        
+        await self.safe_edit_message(
+            query,
+            f"❌ Kullanıcı reddedildi!\n\n👤 ID: {user_id}\n⏰ Tarih: {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+        )
+        
+        # Kullanıcıya red mesajı gönder
+        try:
+            await self.app.bot.send_message(
+                chat_id=user_id,
+                text="❌ Hesap talebiniz reddedildi.\n\n📞 Daha fazla bilgi için yöneticiyle iletişime geçin."
+            )
+        except:
+            pass
+
+    async def handle_user_ban(self, query, data):
+        """Kullanıcı banını işle"""
+        if query.from_user.id != self.ADMIN_ID:
+            await query.answer("❌ Bu işlemi sadece yönetici yapabilir!", show_alert=True)
+            return
+        
+        user_id = int(data.split("_")[1])
+        
+        # Yöneticiyi banlayamaz
+        if user_id == self.ADMIN_ID:
+            await query.answer("❌ Yöneticiyi banlayamazsınız!", show_alert=True)
+            return
+        
+        # Kullanıcı bilgilerini al
+        try:
+            user_info = await self.app.bot.get_chat(user_id)
+            user_name = user_info.first_name or f"ID: {user_id}"
+        except:
+            user_name = f"ID: {user_id}"
+        
+        self.ban_user(user_id)
+        
+        # Aktif session'larını temizle
+        await self.cleanup_user_sessions(user_id)
+        
+        await self.safe_edit_message(
+            query,
+            f"🚫 Kullanıcı banlandı!\n\n👤 {user_name} (ID: {user_id})\n⏰ Tarih: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n✅ Aktif session'ları temizlendi."
+        )
+        
+        # Kullanıcıya ban mesajı gönder
+        try:
+            await self.app.bot.send_message(
+                chat_id=user_id,
+                text="🚫 Hesabınız yasaklandı.\n\n📞 İtiraz için yöneticiyle iletişime geçin."
+            )
+        except:
+            pass
+
+    async def handle_user_unban(self, query, data):
+        """Kullanıcı ban kaldırma işlemini yönet"""
+        if query.from_user.id != self.ADMIN_ID:
+            await query.answer("❌ Bu işlemi sadece yönetici yapabilir!", show_alert=True)
+            return
+        
+        user_id = int(data.split("_")[1])
+        
+        # Kullanıcı bilgilerini al
+        try:
+            user_info = await self.app.bot.get_chat(user_id)
+            user_name = user_info.first_name or f"ID: {user_id}"
+        except:
+            user_name = f"ID: {user_id}"
+        
+        self.unban_user(user_id)
+        
+        await query.edit_message_text(
+            f"✅ Kullanıcının banı kaldırıldı!\n\n👤 {user_name} (ID: {user_id})\n⏰ Tarih: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n🎉 Kullanıcı yeniden onaylandı."
+        )
+        
+        # Kullanıcıya af mesajı gönder
+        try:
+            await self.app.bot.send_message(
+                chat_id=user_id,
+                text="🎉 Banınız kaldırıldı!\n\n✅ Artık bot'u yeniden kullanabilirsiniz.\n📱 /start yazarak başlayabilirsiniz."
+            )
+        except:
+            pass
+    
+    async def show_user_info(self, query, data):
+        """Kullanıcı bilgilerini göster"""
+        if query.from_user.id != self.ADMIN_ID:
+            await query.answer("❌ Bu işlemi sadece yönetici yapabilir!", show_alert=True)
+            return
+        
+        user_id = int(data.split("_")[2])
+        
+        try:
+            user_info = await self.app.bot.get_chat(user_id)
+            user_data = self.load_user_data(user_id)
+            
+            message = f"""👤 KULLANICI BİLGİLERİ
+
+🆔 ID: {user_id}
+👤 Ad: {user_info.first_name or 'Bilinmiyor'}
+👤 Soyad: {user_info.last_name or '-'}
+🔗 Kullanıcı adı: @{user_info.username or 'Yok'}
+✅ Onaylı: {'Evet' if self.is_user_approved(user_id) else 'Hayır'}
+
+📊 Bot Verileri:
+📱 API: {'✅' if user_data.get('api_id') else '❌'}
+📞 Telefon: {'✅' if user_data.get('phone_number') else '❌'}
+📋 Grup: {'✅' if user_data.get('groups') else '❌'}
+📝 Mesaj: {'✅' if user_data.get('message') else '❌'}"""
+            
+            keyboard = [
+                [InlineKeyboardButton("✅ Onayla", callback_data=f"approve_{user_id}"),
+                 InlineKeyboardButton("❌ Reddet", callback_data=f"reject_{user_id}")],
+                [InlineKeyboardButton("🔙 Geri", callback_data="pending_approvals")]
+            ]
+            
+            await query.edit_message_text(
+                message,
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        except Exception as e:
+            await query.edit_message_text(f"❌ Kullanıcı bilgisi alınamadı: {str(e)}")
+    
+    async def show_pending_approvals(self, query, user_id):
+        """Bekleyen onayları göster"""
+        if user_id != self.ADMIN_ID:
+            await query.answer("❌ Bu işlemi sadece yönetici yapabilir!", show_alert=True)
+            return
+        
+        # Tüm kullanıcı dosyalarını kontrol et
+        pending_users = []
+        if os.path.exists(self.users_dir):
+            for filename in os.listdir(self.users_dir):
+                if filename.startswith('user_') and filename.endswith('.json'):
+                    try:
+                        uid = int(filename.replace('user_', '').replace('.json', ''))
+                        if not self.is_user_approved(uid) and uid != self.ADMIN_ID:
+                            pending_users.append(uid)
+                    except:
+                        continue
+        
+        if not pending_users:
+            message = "📋 Bekleyen onay talebi yok."
+            keyboard = [[InlineKeyboardButton("🔙 Ana Menü", callback_data="back")]]
+        else:
+            message = f"⏳ BEKLEYEN ONAYLAR ({len(pending_users)})\n\n"
+            keyboard = []
+            
+            for uid in pending_users[:10]:  # İlk 10 kullanıcı
+                try:
+                    user_info = await self.app.bot.get_chat(uid)
+                    name = user_info.first_name or f"ID: {uid}"
+                    message += f"👤 {name} (ID: {uid})\n"
+                    keyboard.append([InlineKeyboardButton(f"👤 {name}", callback_data=f"user_info_{uid}")])
+                except:
+                    message += f"👤 ID: {uid}\n"
+                    keyboard.append([InlineKeyboardButton(f"👤 ID: {uid}", callback_data=f"user_info_{uid}")])
+            
+            if len(pending_users) > 10:
+                message += f"\n... ve {len(pending_users)-10} kullanıcı daha"
+            
+            keyboard.append([InlineKeyboardButton("🔙 Ana Menü", callback_data="back")])
+        
+        await query.edit_message_text(
+            message,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    async def show_approved_users(self, query, user_id):
+        """Onaylı kullanıcıları göster"""
+        if user_id != self.ADMIN_ID:
+            await query.answer("❌ Bu işlemi sadece yönetici yapabilir!", show_alert=True)
+            return
+        
+        approved_list = list(self.approved_users)
+        
+        if len(approved_list) <= 1:  # Sadece admin varsa
+            message = "📋 Henüz onaylı kullanıcı yok."
+            keyboard = [[InlineKeyboardButton("🔙 Ana Menü", callback_data="back")]]
+        else:
+            message = f"✅ ONAYLI KULLANICILAR ({len(approved_list)})\n\n"
+            keyboard = []
+            
+            for uid in approved_list[:10]:  # İlk 10 kullanıcı - buton limiti için azalttık
+                try:
+                    if uid == self.ADMIN_ID:
+                        message += f"🔑 Yönetici (ID: {uid})\n"
+                        message += f"   📅 Sistem Yöneticisi\n\n"
+                    else:
+                        user_info = await self.app.bot.get_chat(uid)
+                        name = user_info.first_name or f"ID: {uid}"
+                        
+                        # Onay tarihini al
+                        user_data = self.load_user_data(uid)
+                        approved_date = user_data.get('approved_date', 'Bilinmiyor')
+                        if approved_date != 'Bilinmiyor':
+                            try:
+                                # ISO formatından tarihi parse et
+                                date_obj = datetime.fromisoformat(approved_date.replace('Z', '+00:00'))
+                                formatted_date = date_obj.strftime('%d.%m.%Y %H:%M')
+                            except:
+                                formatted_date = approved_date[:16]  # İlk 16 karakter
+                        else:
+                            formatted_date = 'Bilinmiyor'
+                        
+                        message += f"👤 {name} (ID: {uid})\n"
+                        message += f"   📅 Onay: {formatted_date}\n\n"
+                        
+                        # Her kullanıcı için ban butonu ekle
+                        keyboard.append([InlineKeyboardButton(f"🚫 {name} - Ban", callback_data=f"ban_{uid}")])
+                except Exception as e:
+                    message += f"👤 ID: {uid}\n"
+                    message += f"   📅 Onay: Bilinmiyor\n\n"
+                    keyboard.append([InlineKeyboardButton(f"🚫 ID: {uid} - Ban", callback_data=f"ban_{uid}")])
+            
+            if len(approved_list) > 10:
+                message += f"\n... ve {len(approved_list)-10} kullanıcı daha"
+            
+            keyboard.append([InlineKeyboardButton("🔙 Ana Menü", callback_data="back")])
+        
+        await query.edit_message_text(
+            message,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    async def show_banned_users(self, query, user_id):
+        """Yasaklı kullanıcıları göster"""
+        if user_id != self.ADMIN_ID:
+            await query.answer("❌ Bu işlemi sadece yönetici yapabilir!", show_alert=True)
+            return
+        
+        # Yasaklı kullanıcıları bul
+        banned_users = []
+        if os.path.exists(self.users_dir):
+            for filename in os.listdir(self.users_dir):
+                if filename.startswith('user_') and filename.endswith('.json'):
+                    try:
+                        uid = int(filename.replace('user_', '').replace('.json', ''))
+                        user_data = self.load_user_data(uid)
+                        if user_data.get('approval_status') == 'banned':
+                            banned_users.append(uid)
+                    except:
+                        continue
+        
+        if not banned_users:
+            message = "🚫 Yasaklı kullanıcı yok."
+            keyboard = [[InlineKeyboardButton("🔙 Ana Menü", callback_data="back")]]
+        else:
+            message = f"🚫 YASAKLI KULLANICILAR ({len(banned_users)})\n\n"
+            keyboard = []
+            
+            for uid in banned_users[:10]:  # İlk 10 kullanıcı
+                try:
+                    user_info = await self.app.bot.get_chat(uid)
+                    name = user_info.first_name or f"ID: {uid}"
+                    
+                    # Ban tarihini al
+                    user_data = self.load_user_data(uid)
+                    banned_date = user_data.get('banned_date', 'Bilinmiyor')
+                    if banned_date != 'Bilinmiyor':
+                        try:
+                            # ISO formatından tarihi parse et
+                            date_obj = datetime.fromisoformat(banned_date.replace('Z', '+00:00'))
+                            formatted_date = date_obj.strftime('%d.%m.%Y %H:%M')
+                        except:
+                            formatted_date = banned_date[:16]  # İlk 16 karakter
+                    else:
+                        formatted_date = 'Bilinmiyor'
+                    
+                    message += f"👤 {name} (ID: {uid})\n"
+                    message += f"   🚫 Ban: {formatted_date}\n\n"
+                    
+                    # Her kullanıcı için onay butonu ekle
+                    keyboard.append([InlineKeyboardButton(f"✅ {name} - Affet", callback_data=f"unban_{uid}")])
+                except Exception as e:
+                    message += f"👤 ID: {uid}\n"
+                    message += f"   🚫 Ban: Bilinmiyor\n\n"
+                    keyboard.append([InlineKeyboardButton(f"✅ ID: {uid} - Affet", callback_data=f"unban_{uid}")])
+            
+            if len(banned_users) > 10:
+                message += f"\n... ve {len(banned_users)-10} kullanıcı daha"
+            
+            keyboard.append([InlineKeyboardButton("🔙 Ana Menü", callback_data="back")])
+        
+        await query.edit_message_text(
+            message,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    async def check_user_approval_status(self, query, user_id):
+        """Kullanıcının onay durumunu kontrol et"""
+        if self.is_user_approved(user_id):
+            await query.edit_message_text(
+                "🎉 Hesabınız onaylandı!\n\n✅ Artık bot'u kullanabilirsiniz.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Bot'u Kullan", callback_data="back")]])
+            )
+        else:
+            await query.edit_message_text(
+                f"⏳ Hesabınız henüz onaylanmamış.\n\n📝 Kullanıcı ID'niz: {user_id}\n⏰ Lütfen onay bekleyin.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Tekrar Kontrol Et", callback_data="check_approval")],
+                    [InlineKeyboardButton("📞 Yöneticiye Mesaj", callback_data="contact_admin")]
+                ])
+            )
+    
+    async def show_admin_contact(self, query, user_id):
+        """Yönetici iletişim bilgilerini göster"""
+        message = f"""📞 YÖNETİCİ İLETİŞİM
+
+🔑 Yönetici ID: {self.ADMIN_ID}
+
+📝 Onay talebiniz için aşağıdaki bilgileri yöneticiye gönderin:
+
+👤 Adınız: {query.from_user.first_name}
+🆔 ID'niz: {user_id}
+📅 Tarih: {datetime.now().strftime('%d.%m.%Y %H:%M')}
+
+💡 Bu bilgileri yöneticiye göndererek onay talep edebilirsiniz."""
+        
+        keyboard = [
+            [InlineKeyboardButton("🔄 Durumu Kontrol Et", callback_data="check_approval")],
+            [InlineKeyboardButton("🔙 Geri", callback_data="back")]
+        ]
+        
+        await query.edit_message_text(
+            message,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    async def setup_start(self, query, user_id):
+        """Kurulum başlat"""
+        message = """🔧 KURULUM
+
+Adım adım kurulum yapacağız:
+
+1️⃣ API Bilgileri - Telegram API
+2️⃣ Telefon Numarası - Giriş hesabı
+3️⃣ Hedef Gruplar - Mesaj gönderilecek gruplar
+4️⃣ Mesaj İçeriği - Gönderilecek mesaj
+5️⃣ Gönderim Aralığı - Kaç dakikada bir gönderilsin
+
+İlk adım: API bilgileri"""
+        
+        keyboard = [
+            [InlineKeyboardButton("📱 API Bilgilerini Gir", callback_data="add_api")],
+            [InlineKeyboardButton("🔙 Ana Menü", callback_data="back")]
+        ]
+        
+        await query.edit_message_text(
+            message, 
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    async def show_settings(self, query, user_id):
+        """Ayarları göster"""
+        user_data = self.load_user_data(user_id)
+        
+        if not user_data:
+            message = "❌ Henüz kurulum yapmadınız."
+            keyboard = [[InlineKeyboardButton("🔧 Kurulum Başlat", callback_data="setup")]]
+        else:
+            api_status = "✅" if user_data.get('api_id') else "❌"
+            phone_status = "✅" if user_data.get('phone_number') else "❌"
+            
+            # Grup sayısı hesapla ve detaylarını göster
+            groups = user_data.get('groups', [])
+            if isinstance(groups, str):
+                groups = groups.split('\n')
+            
+            groups_count = 0
+            group_types = {'username': 0, 'id': 0, 'phone': 0}
+            
+            for group in groups:
+                if isinstance(group, dict):
+                    groups_count += 1
+                    group_type = group.get('type', 'unknown')
+                    if group_type in group_types:
+                        group_types[group_type] += 1
+                elif isinstance(group, str) and group.strip():
+                    groups_count += 1
+                    group_types['username'] += 1  # Eski format username olarak say
+            
+            message_status = "✅" if user_data.get('message') else "❌"
+            auto_status = "🟢 Aktif" if user_id in self.active_tasks else "🔴 Pasif"
+            
+            # Auto-send istatistiklerini ekle
+            auto_stats = ""
+            if user_id in self.active_tasks:
+                task = self.active_tasks[user_id]
+                # Task başlama zamanını al
+                if hasattr(task, '_start_time'):
+                    start_time = task._start_time.strftime('%H:%M:%S')
+                    auto_stats = f"\n  📊 Başlama: {start_time}"
+                else:
+                    auto_stats = f"\n  📊 Çalışıyor..."
+            
+            # Session durumunu kontrol et
+            session_status = "❌ Giriş Gerekli"
+            if user_data.get('phone_verified') and user_data.get('session_verified'):
+                session_status = "✅ Giriş Yapılmış"
+                if user_data.get('auto_recovery_count'):
+                    session_status += f" (Auto: {user_data.get('auto_recovery_count')})"
+            elif user_data.get('phone_verified'):
+                session_status = "⚠️ Session Geçersiz"
+            
+            # Mesaj aralığını göster
+            interval_minutes = user_data.get('send_interval_minutes', 60)  # Varsayılan 60 dakika
+            hours = interval_minutes // 60
+            minutes = interval_minutes % 60
+            interval_display = f"{hours} saat {minutes} dakika" if hours > 0 else f"{minutes} dakika"
+            
+            # Grup türlerini göster
+            group_details = ""
+            if group_types['username'] > 0:
+                group_details += f"\n  • 🔗 Kullanıcı adı: {group_types['username']}"
+            if group_types['id'] > 0:
+                group_details += f"\n  • 🆔 ID: {group_types['id']}"
+            if group_types['phone'] > 0:
+                group_details += f"\n  • � Telefon: {group_types['phone']}"
+            
+            message = f"""�📊 MEVCUT AYARLAR
+
+🔐 API Bilgileri: {api_status}
+📱 Telefon: {phone_status}
+🔑 Giriş Durumu: {session_status}
+📋 Grup Sayısı: {groups_count}{group_details}
+📝 Mesaj: {message_status}
+⏰ Gönderim Aralığı: {interval_display}
+🤖 Otomatik Gönderim: {auto_status}{auto_stats}
+
+📅 Son Güncelleme: {user_data.get('last_updated', 'Bilinmiyor')[:16]}"""
+            
+            keyboard = [
+                [InlineKeyboardButton("🚀 Şimdi Gönder", callback_data="send_now")],
+                [InlineKeyboardButton("⏰ Otomatik Başlat", callback_data="start_auto"), 
+                 InlineKeyboardButton("⏹️ Otomatik Durdur", callback_data="stop_auto")],
+                [InlineKeyboardButton("📱 API Güncelle", callback_data="add_api"), 
+                 InlineKeyboardButton("📋 Grupları Güncelle", callback_data="add_groups")],
+                [InlineKeyboardButton("📝 Mesajı Güncelle", callback_data="add_message"),
+                 InlineKeyboardButton("⏰ Aralığı Güncelle", callback_data="add_interval")],
+                [InlineKeyboardButton("🔍 Grup Detayları", callback_data="group_details"),
+                 InlineKeyboardButton("🔄 Session Sıfırla", callback_data="reset_session")],
+                [InlineKeyboardButton("🔙 Ana Menü", callback_data="back")]
+            ]
+        
+        await query.edit_message_text(
+            message, 
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    async def show_help(self, query):
+        """Yardım"""
+        message = """❓ YARDIM
+
+Nasıl Çalışır?
+1️⃣ API bilgilerinizi girin
+2️⃣ Telefon numaranızı ekleyin
+3️⃣ Hedef grupları belirleyin
+4️⃣ Mesaj içeriğini yazın
+5️⃣ Gönderim aralığını ayarlayın
+
+API Bilgileri Nasıl Alınır?
+1. https://my.telegram.org
+2. Telefon ile giriş yapın
+3. "API development tools"
+4. Yeni app oluşturun
+5. api_id ve api_hash kopyalayın
+
+Gönderim Seçenekleri:
+🚀 Anlık: Hemen tüm gruplara gönder
+⏰ Otomatik: Belirlediğiniz aralıklarla otomatik gönder
+
+Gönderim Aralıkları:
+• 5-30 dakika: Hızlı gönderim
+• 30-60 dakika: Normal gönderim (önerilen)
+• 60-240 dakika: Yavaş gönderim
+• 240+ dakika: Çok yavaş gönderim
+
+Güvenlik:
+✅ Verileriniz sadece size ait
+✅ API bilgileri güvenle saklanır
+✅ Bot token şifrelidir"""
+        
+        keyboard = [[InlineKeyboardButton("🔙 Ana Menü", callback_data="back")]]
+        
+        await query.edit_message_text(
+            message, 
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    async def start_command_callback(self, query):
+        """Ana menüye dön"""
+        user_name = query.from_user.first_name
+        user_id = query.from_user.id
+        
+        # Yönetici için özel menü
+        if user_id == self.ADMIN_ID:
+            auto_status = "🟢 Aktif" if user_id in self.active_tasks else "🔴 Pasif"
+            
+            # Session kontrolü
+            user_data = self.load_user_data(user_id)
+            session_info = ""
+            if user_data.get('phone_verified') and user_data.get('session_verified'):
+                session_info = "\n🔑 Giriş Durumu: ✅ Giriş Yapılmış"
+            elif user_data.get('phone_verified'):
+                session_info = "\n🔑 Giriş Durumu: ⚠️ Session Süresi Dolmuş"
+            
+            message = f"""🔑 YÖNETİCİ PANELİ
+
+Merhaba {user_name}! 👋
+
+✨ Yönetici Özellikleri:
+📱 Telegram hesabınızı bağlayın
+📋 Hedef grupları ekleyin  
+📝 Mesaj içeriği belirleyin
+🚀 Anlık mesaj gönderimi
+⏰ Özelleştirilebilir otomatik gönderim
+👥 Kullanıcı onayları
+
+Otomatik Gönderim: {auto_status}{session_info}
+
+Başlamak için bir seçenek seçin:"""
+            
+            keyboard = [
+                [InlineKeyboardButton("🔧 Kurulum Başlat", callback_data="setup")],
+                [InlineKeyboardButton("📊 Ayarlarım", callback_data="settings")],
+                [InlineKeyboardButton("👥 Bekleyen Onaylar", callback_data="pending_approvals")],
+                [InlineKeyboardButton("📋 Onaylı Kullanıcılar", callback_data="approved_users")],
+                [InlineKeyboardButton("🚫 Yasaklı Kullanıcılar", callback_data="banned_users")],
+                [InlineKeyboardButton("❓ Yardım", callback_data="help")]
+            ]
+        
+        # Onaylı kullanıcı için normal menü
+        elif self.is_user_approved(user_id):
+            auto_status = "🟢 Aktif" if user_id in self.active_tasks else "🔴 Pasif"
+            
+            # Session kontrolü
+            user_data = self.load_user_data(user_id)
+            session_info = ""
+            if user_data.get('phone_verified') and user_data.get('session_verified'):
+                session_info = "\n🔑 Giriş Durumu: ✅ Giriş Yapılmış"
+            elif user_data.get('phone_verified'):
+                session_info = "\n🔑 Giriş Durumu: ⚠️ Session Süresi Dolmuş"
+            
+            message = f"""🤖 Telegram Mesaj Gönderici Bot
+
+Merhaba {user_name}! 👋
+
+✅ Hesabınız onaylandı!
+
+✨ Özellikler:
+📱 Telegram hesabınızı bağlayın
+📋 Hedef grupları ekleyin  
+📝 Mesaj içeriği belirleyin
+🚀 Anlık mesaj gönderimi
+⏰ Özelleştirilebilir otomatik gönderim
+
+Otomatik Gönderim: {auto_status}{session_info}
+
+Başlamak için kuruluma tıklayın:"""
+            
+            keyboard = [
+                [InlineKeyboardButton("🔧 Kurulum Başlat", callback_data="setup")],
+                [InlineKeyboardButton("📊 Ayarlarım", callback_data="settings")],
+                [InlineKeyboardButton("❓ Yardım", callback_data="help")]
+            ]
+        
+        # Onaysız kullanıcı
+        else:
+            message = f"""🔒 ERİŞİM BEKLEMEDE
+
+Merhaba {user_name}! 👋
+
+⏳ Hesabınız henüz onaylanmamış.
+
+📝 Kullanıcı ID'niz: {user_id}
+👤 Adınız: {user_name}
+
+🔔 Yöneticiye onay talebi gönderilmiştir.
+⏰ Lütfen onay bekleyin."""
+            
+            keyboard = [
+                [InlineKeyboardButton("🔄 Durumu Kontrol Et", callback_data="check_approval")],
+                [InlineKeyboardButton("📞 Yöneticiye Mesaj", callback_data="contact_admin")]
+            ]
+        
+        await query.edit_message_text(
+            message, 
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    # =============================================================================
+    # KURULUM İŞLEMLERİ
+    # =============================================================================
+    
+    async def request_api(self, query, user_id):
+        """API bilgilerini iste"""
+        self.user_states[user_id] = "waiting_api_id"
+        
+        message = """📱 API BİLGİLERİ
+
+Telegram API bilgilerinizi almanız gerekiyor:
+
+1. https://my.telegram.org
+2. Telefon numaranızla giriş yapın
+3. "API development tools"
+4. Yeni uygulama oluşturun
+5. api_id ve api_hash alın
+
+Şimdi api_id numaranızı gönderin:
+(Örnek: 12345678)"""
+        
+        await query.edit_message_text(message)
+        print(f"✅ API bilgileri istendi - Kullanıcı: {user_id}")
+    
+    async def request_groups(self, query, user_id):
+        """Grup listesi iste"""
+        self.user_states[user_id] = "waiting_groups"
+        
+        message = """📋 HEDEF GRUPLAR
+
+Mesaj gönderilecek grupları ekleyin:
+
+📝 Desteklenen Formatlar:
+• 🔗 Kullanıcı adı: @grupadi veya grupadi
+• 🆔 Grup ID'si: -1001234567890
+• 📱 Telefon bağlantısı: +905551234567
+• 🌐 Link: https://t.me/grupadi
+
+✅ Örnekler:
+@reklam_grubu
+-1001234567890
+genel_sohbet
+https://t.me/satis_grubu
++905551234567
+
+💡 Her satıra bir grup yazın:"""
+        
+        await query.edit_message_text(message)
+    
+    async def request_message(self, query, user_id):
+        """Mesaj içeriği iste"""
+        self.user_states[user_id] = "waiting_message"
+        
+        message = """📝 MESAJ İÇERİĞİ
+
+Gruplara gönderilecek mesajı yazın:
+
+✅ Çok satırlı mesaj yazabilirsiniz
+✅ Emoji kullanabilirsiniz
+✅ Özel formatlar desteklenir
+
+Mesajınızı gönderin:"""
+        
+        await query.edit_message_text(message)
+    
+    async def request_interval(self, query, user_id):
+        """Mesaj aralığını iste"""
+        self.user_states[user_id] = "waiting_interval"
+        
+        message = """⏰ MESAJ ARALIĞI
+
+Kaç dakika aralıklarla mesaj göndermek istiyorsunuz?
+
+💡 Öneriler:
+• 30 dakika = Normal hızlı
+• 60 dakika = Orta hızlı (varsayılan)
+• 120 dakika = Yavaş gönderim
+• 240 dakika = Çok yavaş
+
+Sadece sayı girin (dakika cinsinden):
+Örnek: 60"""
+        
+        await query.edit_message_text(message)
+    
+    async def show_group_details(self, query, user_id):
+        """Grup detaylarını göster"""
+        user_data = self.load_user_data(user_id)
+        groups = user_data.get('groups', [])
+        
+        if not groups:
+            message = "📋 Henüz grup eklenmemiş.\n\n➕ Grup eklemek için Ayarlar > Grupları Güncelle"
+            keyboard = [
+                [InlineKeyboardButton("📋 Grup Ekle", callback_data="add_groups")],
+                [InlineKeyboardButton("🔙 Ayarlar", callback_data="settings")]
+            ]
+        else:
+            message = f"📋 GRUP DETAYLARI ({len(groups)} grup)\n\n"
+            
+            for i, group in enumerate(groups[:15], 1):  # İlk 15 grubu göster
+                if isinstance(group, dict):
+                    group_type = group.get('type', 'unknown')
+                    group_value = group.get('value', 'Unknown')
+                    group_display = group.get('display', str(group_value))
+                    
+                    # Grup türü simgesi
+                    type_icon = {
+                        'username': '🔗',
+                        'id': '🆔',
+                        'phone': '📱'
+                    }.get(group_type, '❓')
+                    
+                    message += f"{i}. {type_icon} {group_display}\n"
+                else:
+                    # Eski format (string)
+                    message += f"{i}. 🔗 @{group}\n"
+            
+            if len(groups) > 15:
+                message += f"\n... ve {len(groups) - 15} grup daha"
+            
+            keyboard = [
+                [InlineKeyboardButton("🔍 Grupları Doğrula", callback_data="validate_groups")],
+                [InlineKeyboardButton("📋 Grupları Güncelle", callback_data="add_groups")],
+                [InlineKeyboardButton("🔙 Ayarlar", callback_data="settings")]
+            ]
+        
+        await query.edit_message_text(
+            message,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    async def validate_groups(self, query, user_id):
+        """Grupları doğrula"""
+        user_data = self.load_user_data(user_id)
+        groups = user_data.get('groups', [])
+        
+        if not groups:
+            await query.edit_message_text(
+                "❌ Doğrulanacak grup bulunamadı.\n\n📋 Önce grup ekleyin.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📋 Grup Ekle", callback_data="add_groups")],
+                    [InlineKeyboardButton("🔙 Ayarlar", callback_data="settings")]
+                ])
+            )
+            return
+        
+        # API bilgilerini kontrol et
+        required = ['api_id', 'api_hash', 'phone_number']
+        missing = [field for field in required if not user_data.get(field)]
+        
+        if missing:
+            await query.edit_message_text(
+                f"❌ Grup doğrulaması için API bilgileri gerekli!\n\nEksik: {', '.join(missing)}\n\n🔧 Önce kurulumu tamamlayın.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔧 Kurulum", callback_data="setup")],
+                    [InlineKeyboardButton("🔙 Ayarlar", callback_data="settings")]
+                ])
+            )
+            return
+        
+        await query.edit_message_text("🔍 Gruplar doğrulanıyor... Lütfen bekleyin.")
+        
+        try:
+            # Telethon client oluştur
+            client = await self.create_safe_telethon_client(user_id, user_data)
+            
+            if not await client.is_user_authorized():
+                await query.edit_message_text(
+                    "❌ Telegram hesabı yetkilendirilmemiş!\n\n📱 Önce telefon doğrulaması yapın.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔧 Kurulum", callback_data="setup")],
+                        [InlineKeyboardButton("🔙 Ayarlar", callback_data="settings")]
+                    ])
+                )
+                return
+            
+            # Grupları doğrula
+            validation_results = []
+            valid_groups = 0
+            invalid_groups = 0
+            
+            for i, group in enumerate(groups):
+                if isinstance(group, dict):
+                    can_access, info = await self.validate_group_access(client, group)
+                    group_display = group.get('display', str(group.get('value', 'Unknown')))
+                else:
+                    # Eski format için
+                    temp_group = {'type': 'username', 'value': group, 'display': f"@{group}"}
+                    can_access, info = await self.validate_group_access(client, temp_group)
+                    group_display = f"@{group}"
+                
+                if can_access:
+                    validation_results.append(f"✅ {group_display} - {info}")
+                    valid_groups += 1
+                else:
+                    validation_results.append(f"❌ {group_display} - {info}")
+                    invalid_groups += 1
+                
+                # Her 3 gruptan sonra kısa bekleme
+                if (i + 1) % 3 == 0:
+                    await asyncio.sleep(1)
+            
+            # Güvenli client kapatma
+            await self.safe_disconnect_client(user_id)
+            
+            # Sonuçları göster
+            result_message = f"🔍 GRUP DOĞRULAMA SONUÇLARI\n\n"
+            result_message += f"✅ Erişilebilir: {valid_groups}\n"
+            result_message += f"❌ Erişilemez: {invalid_groups}\n\n"
+            
+            # İlk 10 sonucu göster
+            for result in validation_results[:10]:
+                result_message += f"{result}\n"
+            
+            if len(validation_results) > 10:
+                result_message += f"\n... ve {len(validation_results) - 10} sonuç daha"
+            
+            keyboard = [
+                [InlineKeyboardButton("📋 Grup Detayları", callback_data="group_details")],
+                [InlineKeyboardButton("🔙 Ayarlar", callback_data="settings")]
+            ]
+            
+            await query.edit_message_text(
+                result_message,
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ Grup doğrulama hatası!\n\n{str(e)[:200]}\n\nLütfen tekrar deneyin.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Tekrar Dene", callback_data="validate_groups")],
+                    [InlineKeyboardButton("🔙 Ayarlar", callback_data="settings")]
+                ])
+            )
+    
+    async def reset_user_session(self, query, user_id):
+        """Kullanıcı session'ını sıfırla"""
+        try:
+            user_data = self.load_user_data(user_id)
+            
+            # Kullanıcının tüm session'larını temizle
+            await self.cleanup_user_sessions(user_id)
+            
+            # Session dosyasını sil
+            session_file = self.get_safe_session_file(user_id)
+            if os.path.exists(session_file):
+                try:
+                    os.chmod(session_file, stat.S_IWRITE)
+                    os.remove(session_file)
+                    print(f"🗑️ Session dosyası silindi - {user_id}")
+                except Exception as e:
+                    print(f"⚠️ Session dosyası silinemedi - {user_id}: {str(e)}")
+            
+            # Journal dosyasını da sil
+            journal_file = session_file + '-journal'
+            if os.path.exists(journal_file):
+                try:
+                    os.chmod(journal_file, stat.S_IWRITE)
+                    os.remove(journal_file)
+                    print(f"🗑️ Journal dosyası silindi - {user_id}")
+                except Exception as e:
+                    print(f"⚠️ Journal dosyası silinemedi - {user_id}: {str(e)}")
+            
+            # Session verilerini temizle
+            user_data['phone_verified'] = False
+            user_data['session_verified'] = False
+            user_data['2fa_verified'] = False
+            user_data['phone_code_hash'] = None
+            user_data['entered_code'] = ""
+            user_data['auto_send_active'] = False
+            self.save_user_data(user_id, user_data)
+            
+            # User states'i temizle
+            if user_id in self.user_states:
+                del self.user_states[user_id]
+            
+            keyboard = [
+                [InlineKeyboardButton("🚀 Şimdi Gönder", callback_data="send_now")],
+                [InlineKeyboardButton("📊 Ayarları Görüntüle", callback_data="settings")],
+                [InlineKeyboardButton("🔙 Ana Menü", callback_data="back")]
+            ]
+            
+            await query.edit_message_text(
+                "🔄 SESSION SIFIRLANDI!\n\n"
+                "✅ Session dosyaları silindi\n"
+                "✅ Giriş bilgileri temizlendi\n"
+                "✅ Otomatik gönderim durduruldu\n\n"
+                "💡 Bir sonraki işlemde tekrar giriş yapmanız istenecek.",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            
+            print(f"🔄 Session sıfırlandı - {user_id}")
+            
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ Session sıfırlama hatası!\n\n{str(e)[:200]}\n\nLütfen tekrar deneyin.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Tekrar Dene", callback_data="reset_session")],
+                    [InlineKeyboardButton("🔙 Ayarlar", callback_data="settings")]
+                ])
+            )
+            print(f"❌ Session sıfırlama hatası - {user_id}: {str(e)}")
+    
+    # =============================================================================
+    # MESAJ İŞLEMLERİ
+    # =============================================================================
+    
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Kullanıcı mesajlarını işle"""
+        user_id = update.effective_user.id
+        message_text = update.message.text
+        
+        # Onay kontrolü
+        if not self.is_user_approved(user_id) and user_id != self.ADMIN_ID:
+            await update.message.reply_text(
+                "🔒 Bu botu kullanmak için yönetici onayı gerekiyor.\n\n⏳ Lütfen onay bekleyin veya /start yazın."
+            )
+            return
+        
+        if user_id not in self.user_states:
+            await update.message.reply_text("❓ /start ile başlayabilirsiniz.")
+            return
+        
+        user_state = self.user_states[user_id]
+        user_data = self.load_user_data(user_id)
+        
+        if user_state == "waiting_api_id":
+            try:
+                api_id = int(message_text)
+                user_data['api_id'] = api_id
+                self.save_user_data(user_id, user_data)
+                self.user_states[user_id] = "waiting_api_hash"
+                await update.message.reply_text("✅ API ID kaydedildi!\n\n🔑 Şimdi api_hash değerinizi gönderin:")
+                print(f"✅ API ID kaydedildi - {user_id}: {api_id}")
+            except ValueError:
+                await update.message.reply_text("❌ Geçersiz API ID! Sadece sayı girin.")
+        
+        elif user_state == "waiting_api_hash":
+            user_data['api_hash'] = message_text
+            self.save_user_data(user_id, user_data)
+            self.user_states[user_id] = "waiting_phone"
+            await update.message.reply_text("✅ API Hash kaydedildi!\n\n📱 Telefon numaranızı gönderin:\n(Örnek: +905xxxxxxxxx)")
+            print(f"✅ API Hash kaydedildi - {user_id}")
+        
+        elif user_state == "waiting_phone":
+            if message_text.startswith('+') and len(message_text) >= 10:
+                user_data['phone_number'] = message_text
+                self.save_user_data(user_id, user_data)
+                del self.user_states[user_id]
+                
+                keyboard = [
+                    [InlineKeyboardButton("📋 Grupları Ekle", callback_data="add_groups")],
+                    [InlineKeyboardButton("📊 Ayarları Görüntüle", callback_data="settings")]
+                ]
+                
+                await update.message.reply_text(
+                    "✅ Telefon numarası kaydedildi!\n\n🎉 API ayarları tamamlandı!\n\nSıradaki adım: Grupları ekleyin",
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    
+                )
+            else:
+                await update.message.reply_text("❌ Geçersiz telefon numarası! + ile başlayın.")
+        
+        elif user_state == "waiting_2fa_password":
+            await self.handle_2fa_password(update, user_id, message_text.strip())
+        
+        elif user_state == "waiting_groups":
+            raw_groups = [line.strip() for line in message_text.split('\n') if line.strip()]
+            processed_groups = await self.process_group_list(raw_groups, user_id)
+            
+            if processed_groups:
+                user_data['groups'] = processed_groups
+                self.save_user_data(user_id, user_data)
+                del self.user_states[user_id]
+                
+                keyboard = [
+                    [InlineKeyboardButton("📝 Mesaj Ekle", callback_data="add_message")],
+                    [InlineKeyboardButton("📊 Ayarları Görüntüle", callback_data="settings")]
+                ]
+                
+                # Grup bilgilerini göster
+                group_info = ""
+                for i, group in enumerate(processed_groups[:5], 1):
+                    group_display = self.format_group_display(group)
+                    group_info += f"• {group_display}\n"
+                
+                if len(processed_groups) > 5:
+                    group_info += f"... ve {len(processed_groups)-5} grup daha\n"
+                
+                await update.message.reply_text(
+                    f"✅ {len(processed_groups)} grup kaydedildi!\n\n📋 Gruplar:\n{group_info}\nSıradaki adım: Mesaj içeriğini belirleyin",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+            else:
+                await update.message.reply_text(
+                    "❌ Geçerli grup bulunamadı!\n\n📝 Lütfen geçerli grup formatında tekrar deneyin:\n"
+                    "• @grupadi\n• -1001234567890\n• grupadi\n• https://t.me/grupadi"
+                )
+        
+        elif user_state == "waiting_message":
+            user_data['message'] = message_text
+            self.save_user_data(user_id, user_data)
+            del self.user_states[user_id]
+            
+            keyboard = [
+                [InlineKeyboardButton("⏰ Gönderim Aralığını Belirle", callback_data="add_interval")],
+                [InlineKeyboardButton("� Ayarları Kontrol Et", callback_data="settings")]
+            ]
+            
+            await update.message.reply_text(
+                "✅ Mesaj kaydedildi!\n\n⏰ Son adım: Gönderim aralığını belirleyin",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                
+            )
+        
+        elif user_state == "waiting_interval":
+            try:
+                interval_minutes = int(message_text)
+                if interval_minutes < 5:
+                    await update.message.reply_text("❌ En az 5 dakika olmalı! Lütfen 5 veya daha büyük bir sayı girin.")
+                    return
+                elif interval_minutes > 1440:  # 24 saat
+                    await update.message.reply_text("❌ En fazla 1440 dakika (24 saat) olabilir! Lütfen daha küçük bir sayı girin.")
+                    return
+                
+                user_data['send_interval_minutes'] = interval_minutes
+                self.save_user_data(user_id, user_data)
+                del self.user_states[user_id]
+                
+                # Saat ve dakika cinsinden göster
+                hours = interval_minutes // 60
+                minutes = interval_minutes % 60
+                time_display = f"{hours} saat {minutes} dakika" if hours > 0 else f"{minutes} dakika"
+                
+                keyboard = [
+                    [InlineKeyboardButton("�🚀 Şimdi Gönder", callback_data="send_now")],
+                    [InlineKeyboardButton("⏰ Otomatik Başlat", callback_data="start_auto")],
+                    [InlineKeyboardButton("📊 Ayarları Kontrol Et", callback_data="settings")]
+                ]
+                
+                await update.message.reply_text(
+                    f"✅ Gönderim aralığı kaydedildi!\n\n⏰ Aralık: {time_display}\n\n🎉 Kurulum tamamlandı!\n\nArtık mesajlarınızı gönderebilirsiniz.",
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    
+                )
+            except ValueError:
+                await update.message.reply_text("❌ Geçersiz sayı! Lütfen sadece sayı girin.\n\nÖrnek: 60")
+        
+    
+    # =============================================================================
+    # TELEFON DOĞRULAMA
+    # =============================================================================
+    
+    async def handle_phone_code(self, query, user_id, data):
+        """Telefon kodu butonları"""
+        try:
+            user_data = self.load_user_data(user_id)
+            current_code = user_data.get('entered_code', '')
+            
+            if data == "code_delete":
+                if current_code:
+                    current_code = current_code[:-1]
+                    
+            elif data == "code_confirm":
+                if len(current_code) == 5:
+                    await self.verify_phone_code(query, user_id, current_code)
+                    return
+                else:
+                    await query.answer("❌ 5 haneli kod girin!", show_alert=True)
+                    return
+                    
+            elif data == "code_resend":
+                await self.resend_phone_code(query, user_id)
+                return
+                
+            elif data == "code_cancel":
+                await self.cancel_phone_verification(query, user_id)
+                return
+                
+            else:
+                digit = data.split('_')[1]
+                if len(current_code) < 5:
+                    current_code += digit
+            
+            # Kodu güncelle ve görüntüle
+            user_data['entered_code'] = current_code
+            self.save_user_data(user_id, user_data)
+            
+            code_display = current_code + "_" * (5 - len(current_code))
+            phone_display = user_data['phone_number'].replace('_', '\\_')
+            
+            await query.edit_message_text(
+                f"📱 Telefon doğrulama kodu gönderildi!\n\n"
+                f"📞 Numara: {phone_display}\n\n"
+                f"🔢 5 haneli kodu girin:\n\n"
+                f"Kod: {code_display}\n\n"
+                f"💡 Butonlarla kodu girin",
+                reply_markup=self.get_phone_code_keyboard()
+            )
+            
+        except Exception as e:
+            print(f"❌ Telefon kodu buton hatası: {str(e)}")
+            await query.answer("❌ Hata oluştu!", show_alert=True)
+    
+    async def verify_phone_code(self, query, user_id, code):
+        """Telefon kodunu doğrula"""
+        try:
+            user_data = self.load_user_data(user_id)
+            client = self.telethon_clients.get(user_id)
+            
+            if not client:
+                await query.edit_message_text("❌ Bağlantı bulunamadı. Lütfen yeniden başlayın.")
+                return
+            
+            await query.edit_message_text("🔄 Kod doğrulanıyor...")
+            
+            if not client.is_connected():
+                await client.connect()
+            
+            try:
+                await client.sign_in(
+                    phone=user_data['phone_number'], 
+                    code=code, 
+                    phone_code_hash=user_data['phone_code_hash']
+                )
+                
+                # Başarılı
+                user_data['phone_verified'] = True
+                user_data['session_verified'] = True  # Session geçerliliğini kaydet
+                user_data['entered_code'] = ""
+                self.save_user_data(user_id, user_data)
+                
+                if user_id in self.user_states:
+                    del self.user_states[user_id]
+                
+                await query.edit_message_text(
+                    "✅ Telefon doğrulaması başarılı!\n\n🎉 Hesabınız bağlandı!\n\n"
+                    "💡 Artık tekrar giriş yapmanız gerekmeyecek!\n\n🚀 Mesajlar gönderiliyor..."
+                )
+                
+                print(f"✅ Telefon doğrulaması başarılı - {user_id}")
+                await self.continue_message_sending(user_id)
+                
+            except SessionPasswordNeededError:
+                # 2FA aktif
+                await query.edit_message_text(
+                    "🔐 İki Faktörlü Doğrulama Aktif!\n\n"
+                    "📝 Hesabınızda 2FA aktif. Cloud Password yazın:\n\n"
+                    "💡 Nasıl bulurum?\n"
+                    "Telegram → Ayarlar → Gizlilik ve Güvenlik → İki Aşamalı Doğrulama\n\n"
+                    "🔑 Cloud Password'unuzu mesaj olarak gönderin:"
+                )
+                
+                self.user_states[user_id] = "waiting_2fa_password"
+                user_data['entered_code'] = ""
+                self.save_user_data(user_id, user_data)
+                
+        except Exception as e:
+            print(f"❌ Kod doğrulama hatası - {user_id}: {str(e)}")
+            
+            if "PHONE_CODE_INVALID" in str(e):
+                await query.edit_message_text(
+                    f"❌ Geçersiz kod!\n\n🔢 Lütfen doğru kodu girin.\n\nKod: _____",
+                    reply_markup=self.get_phone_code_keyboard(),
+                    
+                )
+                user_data['entered_code'] = ""
+                self.save_user_data(user_id, user_data)
+            else:
+                await query.edit_message_text(
+                    f"❌ Doğrulama hatası!\n\n{str(e)[:100]}\n\nLütfen tekrar deneyin.",
+                    
+                )
+    
+    async def handle_2fa_password(self, update, user_id, password):
+        """2FA şifre işleme"""
+        try:
+            user_data = self.load_user_data(user_id)
+            client = self.telethon_clients.get(user_id)
+            
+            if not client:
+                await update.message.reply_text("❌ Bağlantı bulunamadı.")
+                return
+            
+            await client.sign_in(password=password)
+            
+            user_data['phone_verified'] = True
+            user_data['2fa_verified'] = True
+            user_data['session_verified'] = True  # Session geçerliliğini kaydet
+            self.save_user_data(user_id, user_data)
+            del self.user_states[user_id]
+            
+            await update.message.reply_text(
+                "✅ 2FA doğrulaması başarılı!\n\n🎉 Hesabınız tamamen doğrulandı!\n\n"
+                "💡 Artık tekrar giriş yapmanız gerekmeyecek!\n\n🚀 Mesajlar gönderiliyor..."
+            )
+            
+            print(f"✅ 2FA doğrulaması başarılı - {user_id}")
+            await self.continue_message_sending(user_id)
+            
+        except Exception as e:
+            print(f"❌ 2FA hatası - {user_id}: {str(e)}")
+            if "PASSWORD_HASH_INVALID" in str(e):
+                await update.message.reply_text(
+                    "❌ Geçersiz şifre!\n\n🔐 Doğru Cloud Password girin.\n\n"
+                    "💡 Telegram Ayarlar → Gizlilik ve Güvenlik → İki Aşamalı Doğrulama"
+                )
+            else:
+                await update.message.reply_text(f"❌ 2FA hatası: {str(e)[:100]}")
+    
+    async def resend_phone_code(self, query, user_id):
+        """Yeni telefon kodu iste"""
+        await query.answer("🔄 Yeni kod isteniyor...")
+        user_data = self.load_user_data(user_id)
+        client = self.telethon_clients.get(user_id)
+        
+        if client:
+            try:
+                if not client.is_connected():
+                    await client.connect()
+                
+                result = await client.send_code_request(user_data['phone_number'])
+                user_data['phone_code_hash'] = result.phone_code_hash
+                user_data['entered_code'] = ""
+                self.save_user_data(user_id, user_data)
+                await query.answer("✅ Yeni kod gönderildi!", show_alert=True)
+            except Exception as e:
+                await query.answer(f"❌ Hata: {str(e)[:50]}", show_alert=True)
+    
+    async def cancel_phone_verification(self, query, user_id):
+        """Telefon doğrulamayı iptal et"""
+        # Güvenli client kapatma
+        await self.safe_disconnect_client(user_id)
+        
+        if user_id in self.user_states:
+            del self.user_states[user_id]
+        
+        await query.edit_message_text(
+            "❌ Telefon doğrulaması iptal edildi.\n\nAna menüye dönmek için /start yazın."
+        )
+    
+    # =============================================================================
+    # MESAJ GÖNDERİMİ
+    # =============================================================================
+    
+    async def send_messages_now(self, query, user_id):
+        """Mesajları şimdi gönder"""
+        user_data = self.load_user_data(user_id)
+        
+        # Gerekli alanları kontrol et
+        required = ['api_id', 'api_hash', 'phone_number', 'groups', 'message']
+        missing = [field for field in required if not user_data.get(field)]
+        
+        if missing:
+            await query.edit_message_text(
+                f"❌ Eksik bilgiler: {', '.join(missing)}\n\nÖnce kurulumu tamamlayın."
+            )
+            return
+        
+        await query.edit_message_text("🚀 Telegram'a bağlanılıyor...")
+        
+        try:
+            # Güvenli Telethon client oluştur
+            client = await self.create_safe_telethon_client(user_id, user_data)
+            
+            # Session geçerliliğini kontrol et
+            is_authorized = False
+            try:
+                is_authorized = await client.is_user_authorized()
+                if is_authorized:
+                    # Session geçerli ise kullanıcının giriş yapmış olduğunu kaydet
+                    user_data['phone_verified'] = True
+                    user_data['session_verified'] = True
+                    self.save_user_data(user_id, user_data)
+                    print(f"✅ Session geçerli, giriş yapılmış - {user_id}")
+            except Exception as e:
+                print(f"⚠️ Session kontrol hatası - {user_id}: {str(e)}")
+                is_authorized = False
+            
+            if not is_authorized:
+                # Otomatik session recovery dene
+                if user_data.get('phone_verified') or user_data.get('session_verified'):
+                    await query.edit_message_text(
+                        "🔄 Session yenileniyor... (Giriş istenmeyecek)\n\n"
+                        "� Önceki session bilgileri kullanılıyor."
+                    )
+                    
+                    try:
+                        # Otomatik giriş dene
+                        await client.start(phone=user_data['phone_number'])
+                        user_data['phone_verified'] = True
+                        user_data['session_verified'] = True
+                        user_data['auto_recovery'] = datetime.now().isoformat()
+                        self.save_user_data(user_id, user_data)
+                        
+                        await query.edit_message_text("✅ Session otomatik olarak yenilendi! Mesajlar gönderiliyor...")
+                        await asyncio.sleep(1)
+                        print(f"✅ Otomatik session recovery başarılı - {user_id}")
+                        
+                    except Exception as recovery_error:
+                        print(f"❌ Otomatik recovery başarısız - {user_id}: {str(recovery_error)}")
+                        
+                        # Son çare olarak manuel doğrulama iste
+                        await self.start_phone_verification(query, user_id, user_data, client)
+                        return
+                        
+                        # Eğer hala authorize değilse telefon doğrulaması başlat
+                        if not await client.is_user_authorized():
+                            await self.start_phone_verification(query, user_id, user_data, client)
+                            return
+                        else:
+                            user_data['session_verified'] = True
+                            self.save_user_data(user_id, user_data)
+                    except Exception as e:
+                        print(f"⚠️ Session yenileme hatası - {user_id}: {str(e)}")
+                        await self.start_phone_verification(query, user_id, user_data, client)
+                        return
+                else:
+                    # İlk kez giriş yapıyor, telefon doğrulaması gerekli
+                    await self.start_phone_verification(query, user_id, user_data, client)
+                    return
+            
+            # Zaten doğrulanmış, mesajları gönder
+            await self.send_messages_with_client(client, user_data, query, user_id)
+            
+        except Exception as e:
+            await query.edit_message_text(f"❌ Hata: {str(e)}")
+    
+    async def start_phone_verification(self, query, user_id, user_data, client):
+        """Telefon doğrulaması başlat"""
+        await query.edit_message_text("📱 Telefon doğrulaması gerekli...")
+        
+        try:
+            result = await client.send_code_request(user_data['phone_number'])
+            self.telethon_clients[user_id] = client
+            user_data['phone_code_hash'] = result.phone_code_hash
+            user_data['entered_code'] = ""
+            self.save_user_data(user_id, user_data)
+            
+            phone_display = user_data['phone_number'].replace('_', '\\_')
+            await query.edit_message_text(
+                f"📱 Telefon doğrulama kodu gönderildi!\n\n"
+                f"📞 Numara: {phone_display}\n\n"
+                f"🔢 5 haneli kodu girin:\n\n"
+                f"Kod: _____\n\n"
+                f"💡 Butonlarla kodu girin",
+                reply_markup=self.get_phone_code_keyboard()
+            )
+            
+            print(f"📱 Telefon kodu gönderildi - {user_id}")
+            
+        except Exception as e:
+            await client.disconnect()
+            await query.edit_message_text(f"❌ Telefon kodu hatası: {str(e)}")
+    
+    async def send_messages_with_client(self, client, user_data, query, user_id):
+        """Client ile mesajları gönder"""
+        try:
+            await query.edit_message_text("🚀 Mesajlar gönderiliyor...")
+            
+            # Grupları hazırla
+            groups = user_data['groups']
+            if isinstance(groups, str):
+                groups = groups.split('\n')
+                groups = [g.strip() for g in groups if g.strip()]
+                # Eski format için düzenle
+                groups = [{'type': 'username', 'value': g, 'display': f"@{g}"} for g in groups]
+            
+            success_count = 0
+            error_messages = []
+            
+            # Her gruba gönder
+            for group_data in groups:
+                if isinstance(group_data, str):
+                    # Eski format desteği
+                    group_data = {'type': 'username', 'value': group_data, 'display': f"@{group_data}"}
+                
+                group_display = group_data.get('display', 'Bilinmeyen Grup')
+                
+                try:
+                    # Grup türüne göre entity al
+                    if group_data['type'] == 'id':
+                        entity = await client.get_entity(group_data['value'])
+                    elif group_data['type'] == 'username':
+                        entity = await client.get_entity(group_data['value'])
+                    elif group_data['type'] == 'phone':
+                        entity = await client.get_entity(group_data['value'])
+                    else:
+                        raise Exception("Desteklenmeyen grup türü")
+                    
+                    # Mesajı gönder
+                    await client.send_message(entity, user_data['message'])
+                    success_count += 1
+                    print(f"✅ {group_display} - Gönderildi")
+                    
+                    # Anti-spam bekleme
+                    await asyncio.sleep(2)
+                    
+                except Exception as e:
+                    error_msg = str(e)
+                    if "CHAT_ADMIN_REQUIRED" in error_msg:
+                        error_messages.append(f"• {group_display}: Admin yetkisi gerekli")
+                    elif "USER_BANNED_IN_CHANNEL" in error_msg:
+                        error_messages.append(f"• {group_display}: Gruptan yasaklısınız")
+                    elif "cannot find any entity" in error_msg:
+                        error_messages.append(f"• {group_display}: Grup bulunamadı")
+                    elif "FLOOD_WAIT" in error_msg:
+                        error_messages.append(f"• {group_display}: Rate limit (çok hızlı gönderim)")
+                    else:
+                        error_messages.append(f"• {group_display}: {error_msg[:30]}")
+                    
+                    print(f"❌ {group_display} - Hata: {error_msg[:50]}")
+            
+            # Client'ı güvenli şekilde kapat
+            await self.safe_disconnect_client(user_id)
+            
+            # Sonucu göster
+            result_message = f"""✅ MESAJ GÖNDERİMİ TAMAMLANDI!
+
+📊 Toplam Grup: {len(groups)}
+✅ Başarılı: {success_count}
+❌ Hatalı: {len(error_messages)}
+
+⏰ Gönderim Zamanı: {datetime.now().strftime('%H:%M:%S')}"""
+            
+            if error_messages:
+                result_message += f"\n\n❌ Hatalar:\n" + "\n".join(error_messages[:5])
+                if len(error_messages) > 5:
+                    result_message += f"\n... ve {len(error_messages)-5} hata daha"
+            
+            keyboard = [
+                [InlineKeyboardButton("🔄 Tekrar Gönder", callback_data="send_now")],
+                [InlineKeyboardButton("🔍 Grup Doğrula", callback_data="validate_groups")],
+                [InlineKeyboardButton("📊 Ayarlar", callback_data="settings")]
+            ]
+            
+            await query.edit_message_text(
+                result_message,
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            
+        except Exception as e:
+            print(f"❌ Mesaj gönderim hatası - {user_id}: {str(e)}")
+            await query.edit_message_text(
+                f"❌ Mesaj gönderim hatası!\n\n{str(e)[:200]}\n\nLütfen tekrar deneyin.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Tekrar Dene", callback_data="send_now")],
+                    [InlineKeyboardButton("📊 Ayarlar", callback_data="settings")]
+                ])
+            )
+    
+    async def continue_message_sending(self, user_id):
+        """Telefon doğrulamasından sonra mesaj gönderimini devam ettir"""
+        try:
+            user_data = self.load_user_data(user_id)
+            client = self.telethon_clients.get(user_id)
+            
+            if not client or not all([user_data.get('api_id'), user_data.get('groups'), user_data.get('message')]):
+                print(f"⚠️ Eksik veriler - {user_id}")
+                return
+            
+            if not client.is_connected():
+                await client.connect()
+            
+            # Grupları hazırla
+            groups = user_data['groups']
+            if isinstance(groups, str):
+                groups = groups.split('\n')
+                groups = [g.strip() for g in groups if g.strip()]
+                # Eski format için düzenle
+                groups = [{'type': 'username', 'value': g, 'display': f"@{g}"} for g in groups]
+            
+            success_count = 0
+            fail_count = 0
+            
+            print(f"🚀 Mesaj gönderimi başlıyor - {user_id}")
+            
+            for group_data in groups:
+                if isinstance(group_data, str):
+                    # Eski format desteği
+                    group_data = {'type': 'username', 'value': group_data, 'display': f"@{group_data}"}
+                
+                group_display = group_data.get('display', 'Bilinmeyen Grup')
+                
+                try:
+                    # Grup türüne göre entity al
+                    if group_data['type'] == 'id':
+                        entity = await client.get_entity(group_data['value'])
+                    elif group_data['type'] == 'username':
+                        entity = await client.get_entity(group_data['value'])
+                    elif group_data['type'] == 'phone':
+                        entity = await client.get_entity(group_data['value'])
+                    else:
+                        raise Exception("Desteklenmeyen grup türü")
+                    
+                    await client.send_message(entity, user_data['message'])
+                    success_count += 1
+                    print(f"✅ Mesaj gönderildi: {group_display}")
+                    await asyncio.sleep(1)
+                except Exception as e:
+                    fail_count += 1
+                    print(f"❌ Hata {group_display}: {str(e)}")
+            
+            # Sonucu bildir
+            try:
+                await self.app.bot.send_message(
+                    chat_id=user_id,
+                    text=f"📊 Mesaj gönderimi tamamlandı!\n\n"
+                         f"✅ Başarılı: {success_count}\n"
+                         f"❌ Başarısız: {fail_count}\n"
+                         f"📝 Toplam grup: {len(groups)}"
+                )
+            except Exception as e:
+                print(f"❌ Sonuç bildirimi hatası: {str(e)}")
+                
+        except Exception as e:
+            print(f"❌ Devam ettirme hatası - {user_id}: {str(e)}")
+        finally:
+            # Güvenli client kapatma
+            await self.safe_disconnect_client(user_id)
+    
+    # =============================================================================
+    # OTOMATİK GÖNDERİM
+    # =============================================================================
+    
+    async def start_auto_send(self, query, user_id):
+        """Otomatik gönderim başlat"""
+        user_data = self.load_user_data(user_id)
+        
+        required = ['api_id', 'api_hash', 'phone_number', 'groups', 'message']
+        missing = [field for field in required if not user_data.get(field)]
+        
+        if missing:
+            await query.edit_message_text(
+                f"❌ Eksik bilgiler: {', '.join(missing)}"
+            )
+            return
+        
+        if user_id in self.active_tasks:
+            await query.edit_message_text("⚠️ Otomatik gönderim zaten aktif!")
+            return
+        
+        # Otomatik gönderim başlat
+        task = asyncio.create_task(self.auto_send_loop(user_id))
+        self.active_tasks[user_id] = task
+        
+        user_data['auto_send_active'] = True
+        user_data['auto_send_started'] = datetime.now().isoformat()
+        self.save_user_data(user_id, user_data)
+        
+        # Cloud platform için state kaydet
+        self.save_bot_state()
+        
+        # Grup sayısı hesapla
+        groups = user_data['groups']
+        if isinstance(groups, str):
+            groups = groups.split('\n')
+            groups_count = len([g.strip() for g in groups if g.strip()])
+        elif isinstance(groups, list):
+            groups_count = len(groups)
+        else:
+            groups_count = 0
+        
+        # Mesaj aralığını al
+        interval_minutes = user_data.get('send_interval_minutes', 60)
+        hours = interval_minutes // 60
+        minutes = interval_minutes % 60
+        interval_display = f"{hours} saat {minutes} dakika" if hours > 0 else f"{minutes} dakika"
+        
+        keyboard = [
+            [InlineKeyboardButton("⏹️ Durdur", callback_data="stop_auto")],
+            [InlineKeyboardButton("📊 Ayarlar", callback_data="settings")],
+            [InlineKeyboardButton("🔙 Ana Menü", callback_data="back")]
+        ]
+        
+        await query.edit_message_text(
+            f"⏰ OTOMATİK GÖNDERİM BAŞLATILDI!\n\n"
+            f"🎯 Ayarlar:\n"
+            f"• Grup sayısı: {groups_count}\n"
+            f"• Gönderim aralığı: {interval_display}\n"
+            f"• Başlangıç: {datetime.now().strftime('%H:%M:%S')}\n\n"
+            f"📝 Mesaj:\n"
+            f"{user_data['message'][:100]}{'...' if len(user_data['message']) > 100 else ''}\n\n"
+            f"✅ İlk mesaj {interval_display} sonra gönderilecek!",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    async def stop_auto_send(self, query, user_id):
+        """Otomatik gönderimi durdur"""
+        if user_id in self.active_tasks:
+            self.active_tasks[user_id].cancel()
+            del self.active_tasks[user_id]
+            
+            # Güvenli client kapatma
+            await self.safe_disconnect_client(user_id)
+            
+            user_data = self.load_user_data(user_id)
+            user_data['auto_send_active'] = False
+            user_data['auto_send_stopped'] = datetime.now().isoformat()
+            self.save_user_data(user_id, user_data)
+            
+            # Cloud platform için state kaydet
+            self.save_bot_state()
+            
+            keyboard = [
+                [InlineKeyboardButton("⏰ Tekrar Başlat", callback_data="start_auto")],
+                [InlineKeyboardButton("📊 Ayarlar", callback_data="settings")],
+                [InlineKeyboardButton("🔙 Ana Menü", callback_data="back")]
+            ]
+            
+            await query.edit_message_text(
+                f"⏹️ OTOMATİK GÖNDERİM DURDURULDU!\n\n⏰ Zaman: {datetime.now().strftime('%H:%M:%S')}",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        else:
+            await query.edit_message_text("❌ Aktif otomatik gönderim bulunamadı!")
+    
+    async def auto_send_loop(self, user_id):
+        """Otomatik gönderim döngüsü"""
+        user_data = self.load_user_data(user_id)
+        
+        # Başlama zamanını kaydet
+        import datetime
+        start_time = datetime.datetime.now()
+        
+        # Task'a başlama zamanını ekle
+        if user_id in self.active_tasks:
+            self.active_tasks[user_id]._start_time = start_time
+        
+        try:
+            # Güvenli Telethon client oluştur
+            client = await self.create_safe_telethon_client(user_id, user_data)
+            
+            # Session geçerliliğini kontrol et
+            is_authorized = False
+            try:
+                is_authorized = await client.is_user_authorized()
+                if is_authorized:
+                    user_data['session_verified'] = True
+                    self.save_user_data(user_id, user_data)
+                    print(f"✅ Otomatik gönderim - Session geçerli - {user_id}")
+                else:
+                    print(f"🔄 Otomatik gönderim - Session recovery - {user_id}")
+                    
+                    # Otomatik session recovery (telefon doğrulama istenmeyecek)
+                    if user_data.get('phone_verified') or user_data.get('session_verified'):
+                        try:
+                            await client.start(phone=user_data['phone_number'])
+                            user_data['session_verified'] = True
+                            user_data['auto_recovery_count'] = user_data.get('auto_recovery_count', 0) + 1
+                            self.save_user_data(user_id, user_data)
+                            print(f"✅ Otomatik session recovery başarılı - {user_id}")
+                        except Exception as e:
+                            print(f"❌ Otomatik session recovery başarısız - {user_id}: {str(e)}")
+                            
+                            # Kullanıcıya bildirim gönder
+                            try:
+                                await self.app.bot.send_message(
+                                    chat_id=user_id,
+                                    text="⚠️ Otomatik gönderim durdu!\n\n"
+                                         "🔑 Session süresi dolmuş. Lütfen /start ile tekrar giriş yapın.\n\n"
+                                         "💡 Bu durum nadiren oluşur ve tek seferlik yeniden giriş gerektirir."
+                                )
+                            except:
+                                pass
+                            return
+                    else:
+                        print(f"❌ İlk kez giriş gerekli - {user_id}")
+                        return
+            except Exception as e:
+                print(f"❌ Session kontrol hatası - {user_id}: {str(e)}")
+                return
+            
+            self.telethon_clients[user_id] = client
+            
+            # Kullanıcının belirlediği aralığı al (dakika cinsinden)
+            interval_minutes = user_data.get('send_interval_minutes', 60)  # Varsayılan 60 dakika
+            interval_seconds = interval_minutes * 60  # Saniyeye çevir
+            
+            print(f"🤖 Otomatik gönderim başladı - {user_id} - Aralık: {interval_minutes} dakika")
+            
+            # İlk gönderimi hemen yap
+            first_send = True
+            
+            while True:
+                # İlk gönderim değilse bekle
+                if not first_send:
+                    print(f"⏰ Sonraki gönderim için bekleniyor - {user_id} - {interval_minutes} dakika")
+                    await asyncio.sleep(interval_seconds)
+                else:
+                    first_send = False
+                    print(f"🚀 İlk gönderim başlıyor - {user_id}")
+                
+                current_data = self.load_user_data(user_id)
+                if not current_data.get('auto_send_active', False):
+                    print(f"🛑 Otomatik gönderim durduruldu - {user_id}")
+                    break
+                
+                # Güncel aralığı kontrol et (kullanıcı değiştirmiş olabilir)
+                new_interval = current_data.get('send_interval_minutes', 60)
+                if new_interval != interval_minutes:
+                    interval_minutes = new_interval
+                    interval_seconds = interval_minutes * 60
+                    print(f"🔄 Gönderim aralığı güncellendi - {user_id} - Yeni aralık: {interval_minutes} dakika")
+                
+                # Grupları hazırla
+                groups = current_data['groups']
+                if isinstance(groups, str):
+                    groups = groups.split('\n')
+                    groups = [g.strip() for g in groups if g.strip()]
+                    # Eski format için düzenle
+                    groups = [{'type': 'username', 'value': g, 'display': f"@{g}"} for g in groups]
+                
+                success_count = 0
+                print(f"📤 Otomatik gönderim - {user_id} - {len(groups)} grup - {interval_minutes} dakika aralık")
+                
+                for group_data in groups:
+                    if isinstance(group_data, str):
+                        # Eski format desteği
+                        group_data = {'type': 'username', 'value': group_data, 'display': f"@{group_data}"}
+                    
+                    group_display = group_data.get('display', 'Bilinmeyen Grup')
+                    
+                    try:
+                        # Grup türüne göre entity al
+                        if group_data['type'] == 'id':
+                            entity = await client.get_entity(group_data['value'])
+                        elif group_data['type'] == 'username':
+                            entity = await client.get_entity(group_data['value'])
+                        elif group_data['type'] == 'phone':
+                            entity = await client.get_entity(group_data['value'])
+                        else:
+                            raise Exception("Desteklenmeyen grup türü")
+                        
+                        await client.send_message(entity, current_data['message'])
+                        success_count += 1
+                        print(f"✅ {group_display} - Başarılı")
+                        await asyncio.sleep(2)
+                    except Exception as e:
+                        print(f"❌ {group_display} - Hata: {str(e)[:30]}")
+                
+                print(f"📊 Otomatik gönderim tamamlandı - {user_id} - {success_count}/{len(groups)} - Sonraki: {interval_minutes} dakika sonra")
+                
+                # İstatistikleri güncelle
+                current_data['last_auto_send'] = datetime.now().isoformat()
+                current_data['total_auto_sends'] = current_data.get('total_auto_sends', 0) + 1
+                current_data['last_success_count'] = success_count
+                current_data['last_total_groups'] = len(groups)
+                self.save_user_data(user_id, current_data)
+                
+                print(f"💾 İstatistikler kaydedildi - {user_id} - Toplam gönderim: {current_data['total_auto_sends']}")
+                
+        except asyncio.CancelledError:
+            print(f"🛑 Otomatik gönderim iptal edildi - {user_id}")
+            raise  # Task cancel sinyalini yukarı ilet
+        except Exception as e:
+            print(f"❌ Otomatik gönderim kritik hatası - {user_id}: {str(e)}")
+            print(f"🔍 Hata detayı - {user_id}: {repr(e)}")
+            
+            # Task hatasında otomatik gönderimi durdur
+            user_data = self.load_user_data(user_id)
+            user_data['auto_send_active'] = False
+            user_data['auto_send_error'] = str(e)
+            user_data['auto_send_error_time'] = datetime.now().isoformat()
+            self.save_user_data(user_id, user_data)
+        finally:
+            # Güvenli client kapatma ve cleanup
+            await self.cleanup_user_sessions(user_id)
+    
+    # =============================================================================
+    # BOT ÇALIŞTIRMA
+    # =============================================================================
+    
+    def run(self):
+        """Bot'u çalıştır"""
+        print("🤖 Bot başlatılıyor...")
+        print(f"📁 Kullanıcı verileri: {os.path.abspath(self.users_dir)}")
+        print(f"🔑 Bot Token: {self.BOT_TOKEN[:20]}...")
+        
+        # Eski session dosyalarını temizle
+        self.cleanup_old_sessions()
+        
+        if self.BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+            print("❌ HATA: Bot token ayarlanmamış!")
+            return
+        
+        try:
+            application = Application.builder().token(self.BOT_TOKEN).build()
+            self.app = application
+            
+            # Handler'ları ekle
+            application.add_handler(CommandHandler("start", self.start_command))
+            application.add_handler(CallbackQueryHandler(self.button_callback))
+            application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+            
+            print("✅ Bot hazır! Kullanıcılardan mesaj bekleniyor...")
+            print("🔗 Telegram'da botunuzu bulun ve /start yazın")
+            print("📊 Debug modunda çalışıyor")
+            
+            try:
+                # Event loop'u al ve session initialization'ı schedule et
+                loop = asyncio.get_event_loop()
+                
+                # Session initialize ve heartbeat task'larını schedule et
+                async def delayed_init():
+                    await asyncio.sleep(2)  # Bot başlayana kadar bekle
+                    await self.initialize_all_sessions()
+                    
+                    # Cloud platform için heartbeat başlat
+                    if self.is_cloud_platform:
+                        await self.start_heartbeat()
+                        print("💓 7/24 aktif mod - Heartbeat başlatıldı")
+                
+                # Task'ı schedule et
+                loop.create_task(delayed_init())
+                
+                print("🚀 Bot polling başlıyor...")
+                application.run_polling()
+            except KeyboardInterrupt:
+                print("\n🛑 Bot durduruluyor...")
+                # Async cleanup çalıştır
+                asyncio.get_event_loop().run_until_complete(self.global_cleanup())
+                self.cleanup_all_clients()
+            finally:
+                print("✅ Bot kapatıldı")
+            
+        except Exception as e:
+            print(f"❌ Bot başlatma hatası: {str(e)}")
+            self.cleanup_all_clients()
+            return
+    
+    def cleanup_all_clients(self):
+        """Tüm client'ları temizle"""
+        print("🧹 Client'lar temizleniyor...")
+        
+        # Event loop kontrolü
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        async def cleanup_async():
+            # Active task'ları iptal et
+            for user_id in list(self.active_tasks.keys()):
+                try:
+                    self.active_tasks[user_id].cancel()
+                    del self.active_tasks[user_id]
+                    print(f"✅ Task iptal edildi - {user_id}")
+                except Exception as e:
+                    print(f"⚠️ Task iptal hatası - {user_id}: {str(e)}")
+            
+            # Client'ları kapat
+            for user_id in list(self.telethon_clients.keys()):
+                try:
+                    client = self.telethon_clients[user_id]
+                    if client and client.is_connected():
+                        await asyncio.wait_for(client.disconnect(), timeout=3.0)
+                    del self.telethon_clients[user_id]
+                    print(f"✅ Client temizlendi - {user_id}")
+                except Exception as e:
+                    print(f"⚠️ Client temizleme hatası - {user_id}: {str(e)}")
+                    try:
+                        del self.telethon_clients[user_id]
+                    except:
+                        pass
+        
+        try:
+            if loop.is_running():
+                # Eğer loop çalışıyorsa, task olarak çalıştır
+                asyncio.create_task(cleanup_async())
+            else:
+                # Loop çalışmıyorsa, sync olarak çalıştır
+                loop.run_until_complete(cleanup_async())
+        except Exception as e:
+            print(f"⚠️ Cleanup hatası: {str(e)}")
+        finally:
+            if not loop.is_running():
+                try:
+                    loop.close()
+                except:
+                    pass
+
+# Bot'u çalıştır
+if __name__ == '__main__':
+    bot = TelegramBot()
+    bot.run()

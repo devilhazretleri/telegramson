@@ -1,0 +1,62 @@
+# 🐳 Docker Compose Yapılandırması
+# Telegram Bot için Docker Compose dosyası
+
+version: '3.8'
+
+services:
+  telegram-bot:
+    # 🏗️ Build ayarları
+    build:
+      context: .
+      dockerfile: Dockerfile
+    
+    # 🏷️ Container adı
+    container_name: telegram_message_bot
+    
+    # 🔄 Restart policy - her zaman yeniden başlat
+    restart: unless-stopped
+    
+    # 🌐 Environment variables
+    environment:
+      - TZ=Europe/Istanbul
+      - PYTHONUNBUFFERED=1
+      - PYTHONIOENCODING=utf-8
+    
+    # 📂 Volume mounts - veri kalıcılığı için
+    volumes:
+      - ./bot_users:/app/bot_users
+      - ./logs:/app/logs
+    
+    # 🌐 Network ayarları (isteğe bağlı)
+    # ports:
+    #   - "8080:8080"
+    
+    # 🔧 Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+        reservations:
+          memory: 256M
+          cpus: '0.25'
+    
+    # 🩺 Health check
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    
+    # 📝 Logging ayarları
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# 📡 Networks (isteğe bağlı)
+networks:
+  default:
+    name: telegram-bot-network

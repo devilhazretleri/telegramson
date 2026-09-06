@@ -1,0 +1,41 @@
+# Telegram Bot Requirements
+# Bu dosya telegram_bot.py için gerekli Python kütüphanelerini listeler
+
+# 🤖 Telegram Bot API
+python-telegram-bot==21.0
+
+# 📱 Telethon - Telegram Client API  
+telethon==1.36.0
+
+# 🗄️ MongoDB için Python driver
+pymongo==4.10.1
+
+# 🌍 Zaman dilimi işlemleri için
+pytz==2025.1
+
+# 🔄 Async programlama (Python 3.7+ ile birlikte gelir)
+# asyncio - built-in
+
+# 📊 JSON işlemleri (Python ile birlikte gelir)
+# json - built-in
+
+# 📁 Dosya işlemleri (Python ile birlikte gelir)
+# os - built-in
+
+# 🧵 Threading (Python ile birlikte gelir)
+# threading - built-in
+
+# ⏱️ Zaman işlemleri (Python ile birlikte gelir)
+# time - built-in
+
+# 📅 Tarih ve saat işlemleri (Python ile birlikte gelir)
+# datetime - built-in
+
+# 🌐 Glob pattern matching (Python ile birlikte gelir)
+# glob - built-in
+
+# 📈 Statistics (Python ile birlikte gelir)
+# stat - built-in
+
+# 🔐 İsteğe bağlı güvenlik kütüphaneleri (gelecek sürümler için)
+# cryptography==41.0.7

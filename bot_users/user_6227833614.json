@@ -1,0 +1,23 @@
+{
+  "api_id": 27277851,
+  "last_updated": "2025-07-29T13:18:25.613802",
+  "user_id": 6227833614,
+  "api_hash": "9bf994f477895979f996a79e84f6e73f",
+  "phone_number": "+905070307419",
+  "groups": [
+    "@polatalemdardeneme"
+  ],
+  "message": "@autoreklambot9bf994f477895979f996a79e84f6e73f",
+  "phone_code_hash": "d9d1d885209839afe6",
+  "entered_code": "",
+  "phone_verified": true,
+  "2fa_verified": true,
+  "auto_send_active": true,
+  "auto_send_started": "2025-07-29T12:02:17.435000",
+  "send_interval_minutes": 30,
+  "session_verified": true,
+  "banned_date": "2025-07-29T12:29:05.127985",
+  "approval_status": "approved",
+  "unbanned_date": "2025-07-29T12:29:14.281662",
+  "auto_login_success": "2025-07-29T13:18:25.613802"
+}

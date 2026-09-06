@@ -1,0 +1,52 @@
+{
+  "api_id": 25968043,
+  "last_updated": "2025-07-29T13:18:26.129123",
+  "user_id": 6615127610,
+  "api_hash": "d4b8c2f06079d6ea8ac05a51fe8b897f",
+  "phone_number": "+905073187233",
+  "groups": [
+    {
+      "type": "id",
+      "value": -1002083962761,
+      "display": "ID: -1002083962761",
+      "original": "-1002083962761"
+    },
+    {
+      "type": "username",
+      "value": "polatalemdardeneme",
+      "display": "@polatalemdardeneme",
+      "original": "@polatalemdardeneme"
+    },
+    {
+      "type": "id",
+      "value": -1002083962761,
+      "display": "ID: -1002083962761",
+      "original": "-1002083962761"
+    }
+  ],
+  "message": "-1002083962761\n@polatalemdardeneme\n-1002083962761",
+  "auto_send_active": true,
+  "auto_send_started": "2025-07-29T12:19:56.379773",
+  "auto_send_stopped": "2025-07-26T20:50:21.142827",
+  "phone_code_hash": null,
+  "entered_code": "",
+  "phone_verified": true,
+  "2fa_verified": false,
+  "send_interval_minutes": 30,
+  "last_auto_send": "2025-07-29T12:49:59.708226",
+  "total_auto_sends": 2,
+  "last_manual_send": "2025-07-29T10:19:46.313404",
+  "total_manual_sends": 3,
+  "last_send_success_count": 1,
+  "last_send_total_count": 3,
+  "auto_send_interval": 60,
+  "stats": {
+    "manual_sends": 0,
+    "auto_sends": 0,
+    "last_active": "2025-07-29T11:45:36.795432",
+    "groups_count": 3,
+    "total_sends": 0
+  },
+  "session_verified": true,
+  "auto_login_success": "2025-07-29T13:18:26.129123"
+}
