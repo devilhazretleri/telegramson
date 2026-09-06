@@ -53,7 +53,7 @@ class TelegramBot:
     # ===================== BOT INITIALIZATION =======================
     def __init__(self):
         # BotFather token
-        self.BOT_TOKEN = "7436117955:AAFDbqeaaK-5iufvKdiKCgQnQUXboQuZIg8"
+        self.BOT_TOKEN = "8188644646:AAFcaiJKZKtnXJo5DZSWLUORq4f_Dj_W-Nc"
         
         # YÖNETİCİ ID'Sİ
         self.ADMIN_ID = 6615127610
